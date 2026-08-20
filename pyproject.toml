@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-strategy-simulator"
+version = "0.16.0"
+description = "An educational, deterministic trading strategy simulator"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["pandas>=2.2,<4"]
+
+[project.scripts]
+trading-sim = "trading_simulator.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.setuptools.packages.find]
+where = ["src"]
