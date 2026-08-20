@@ -7,10 +7,14 @@ import os
 import secrets
 import subprocess
 import sys
+import base64
+import hashlib
+import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Mapping
 from threading import Event, Lock, Thread
@@ -29,6 +33,118 @@ from .portfolio_risk import PortfolioRiskController, load_portfolio_risk_policy
 ASSETS = ("btc", "eth", "sol", "xrp")
 DASHBOARD_MAX_DEMO_ORDER_USD = Decimal("1000.00")
 AUTOMATION_ARMING_PHRASE = "I_ENABLE_RULE_BASED_DEMO_AUTOMATION"
+PASSWORD_HASH_ITERATIONS = 600_000
+SESSION_COOKIE = "codex_trading_session"
+SESSION_LIFETIME = timedelta(hours=8)
+
+
+def hash_dashboard_password(password: str) -> str:
+    """Return a salted password hash suitable for DASHBOARD_PASSWORD_HASH."""
+    if len(password) < 12:
+        raise ValueError("dashboard password must contain at least 12 characters")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS
+    )
+    return "$".join(
+        (
+            "pbkdf2_sha256",
+            str(PASSWORD_HASH_ITERATIONS),
+            base64.urlsafe_b64encode(salt).decode("ascii"),
+            base64.urlsafe_b64encode(digest).decode("ascii"),
+        )
+    )
+
+
+def verify_dashboard_password(password: str, encoded: str) -> bool:
+    """Verify a password without exposing malformed-hash details."""
+    try:
+        algorithm, iterations_text, salt_text, digest_text = encoded.split("$")
+        iterations = int(iterations_text)
+        if algorithm != "pbkdf2_sha256" or not 100_000 <= iterations <= 2_000_000:
+            return False
+        salt = base64.urlsafe_b64decode(salt_text.encode("ascii"))
+        expected = base64.urlsafe_b64decode(digest_text.encode("ascii"))
+        actual = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, iterations
+        )
+        return secrets.compare_digest(actual, expected)
+    except (ValueError, TypeError, UnicodeError):
+        return False
+
+
+class DashboardAuthenticator:
+    """In-memory, expiring dashboard sessions backed by an environment hash."""
+
+    def __init__(self, username: str, password_hash: str) -> None:
+        username = username.strip()
+        if not username or len(username) > 80:
+            raise ValueError("DASHBOARD_USERNAME must contain 1 to 80 characters")
+        parts = password_hash.split("$")
+        try:
+            valid_hash = (
+                len(parts) == 4
+                and parts[0] == "pbkdf2_sha256"
+                and 100_000 <= int(parts[1]) <= 2_000_000
+                and bool(base64.urlsafe_b64decode(parts[2].encode("ascii")))
+                and bool(base64.urlsafe_b64decode(parts[3].encode("ascii")))
+            )
+        except (ValueError, UnicodeError):
+            valid_hash = False
+        if not valid_hash:
+            raise ValueError("DASHBOARD_PASSWORD_HASH is malformed")
+        self.username = username
+        self.password_hash = password_hash
+        self._sessions: dict[str, datetime] = {}
+        self._failures: dict[str, list[float]] = {}
+        self._lock = Lock()
+
+    @classmethod
+    def from_environment(cls) -> "DashboardAuthenticator":
+        username = os.environ.get("DASHBOARD_USERNAME", "")
+        password_hash = os.environ.get("DASHBOARD_PASSWORD_HASH", "")
+        if not username or not password_hash:
+            raise ValueError(
+                "set DASHBOARD_USERNAME and DASHBOARD_PASSWORD_HASH before starting the dashboard"
+            )
+        return cls(username, password_hash)
+
+    def login(self, username: str, password: str, client: str) -> str | None:
+        now = time.monotonic()
+        with self._lock:
+            recent = [item for item in self._failures.get(client, []) if now - item < 60]
+            self._failures[client] = recent
+            if len(recent) >= 5:
+                return None
+        password_valid = verify_dashboard_password(password, self.password_hash)
+        valid = secrets.compare_digest(username, self.username) and password_valid
+        if not valid:
+            with self._lock:
+                self._failures.setdefault(client, []).append(now)
+            return None
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._failures.pop(client, None)
+            self._purge_expired()
+            self._sessions[token] = datetime.now(UTC) + SESSION_LIFETIME
+        return token
+
+    def authenticated(self, token: str) -> bool:
+        if not token:
+            return False
+        with self._lock:
+            self._purge_expired()
+            return token in self._sessions
+
+    def logout(self, token: str) -> None:
+        with self._lock:
+            self._sessions.pop(token, None)
+
+    def _purge_expired(self) -> None:
+        now = datetime.now(UTC)
+        self._sessions = {
+            token: expiry for token, expiry in self._sessions.items() if expiry > now
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1268,7 +1384,10 @@ class DemoAutomationCoordinator:
 
 
 def serve_dashboard(
-    data_dir: str | Path, port: int, project_dir: str | Path = "."
+    data_dir: str | Path,
+    port: int,
+    project_dir: str | Path = ".",
+    authenticator: DashboardAuthenticator | None = None,
 ) -> None:
     if not 1 <= port <= 65535:
         raise ValueError("dashboard port must be between 1 and 65535")
@@ -1277,13 +1396,25 @@ def serve_dashboard(
     monitors = DashboardMonitorManager(project_dir, data_dir)
     automation = DemoAutomationCoordinator(source, actions, monitors, data_dir)
     action_token = secrets.token_urlsafe(32)
+    auth = authenticator or DashboardAuthenticator.from_environment()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-            if self.path in ("/", "/index.html"):
+            path = self.path.split("?", 1)[0]
+            if path == "/login":
+                if self._authenticated():
+                    self._redirect("/")
+                else:
+                    self._send(200, "text/html; charset=utf-8", LOGIN_HTML.encode())
+            elif not self._authenticated():
+                if path.startswith("/api/"):
+                    self._json(401, {"ok": False, "error": "authentication required"})
+                else:
+                    self._redirect("/login")
+            elif path in ("/", "/index.html"):
                 page = HTML.replace("__ACTION_TOKEN__", action_token)
                 self._send(200, "text/html; charset=utf-8", page.encode())
-            elif self.path == "/api/status":
+            elif path == "/api/status":
                 document = source.snapshot().as_dict()
                 for asset in document["assets"]:
                     name = str(asset["asset"])
@@ -1296,9 +1427,21 @@ def serve_dashboard(
 
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             try:
-                if not secrets.compare_digest(
-                    self.headers.get("X-Dashboard-Token", ""), action_token
-                ):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/login":
+                    self._login()
+                    return
+                if not self._authenticated():
+                    self._json(401, {"ok": False, "error": "authentication required"})
+                    return
+                if path == "/api/logout":
+                    if not self._valid_action_token(action_token):
+                        self._json(403, {"ok": False, "error": "invalid action token"})
+                        return
+                    auth.logout(self._session_token())
+                    self._json(200, {"ok": True}, clear_cookie=True)
+                    return
+                if not self._valid_action_token(action_token):
                     self._json(403, {"ok": False, "error": "invalid action token"})
                     return
                 if self.headers.get_content_type() != "application/json":
@@ -1470,20 +1613,90 @@ def serve_dashboard(
                         },
                     )
 
-        def _json(self, status: int, value: Mapping[str, Any]) -> None:
+        def _login(self) -> None:
+            if self.headers.get_content_type() != "application/json":
+                self._json(415, {"ok": False, "error": "JSON required"})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 1 <= length <= 4096:
+                self._json(400, {"ok": False, "error": "invalid request size"})
+                return
+            value = json.loads(self.rfile.read(length))
+            if not isinstance(value, Mapping):
+                raise ValueError("request must be an object")
+            username, password = value.get("username"), value.get("password")
+            if not isinstance(username, str) or not isinstance(password, str):
+                raise ValueError("username and password must be text")
+            token = auth.login(username, password, self.client_address[0])
+            if token is None:
+                time.sleep(0.25)
+                self._json(401, {"ok": False, "error": "invalid username or password"})
+                return
+            self._json(200, {"ok": True}, session_token=token)
+
+        def _session_token(self) -> str:
+            cookie = SimpleCookie(self.headers.get("Cookie", ""))
+            value = cookie.get(SESSION_COOKIE)
+            return value.value if value is not None else ""
+
+        def _authenticated(self) -> bool:
+            return auth.authenticated(self._session_token())
+
+        def _valid_action_token(self, expected: str) -> bool:
+            return secrets.compare_digest(
+                self.headers.get("X-Dashboard-Token", ""), expected
+            )
+
+        def _redirect(self, location: str) -> None:
+            self.send_response(303)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _json(
+            self,
+            status: int,
+            value: Mapping[str, Any],
+            *,
+            session_token: str | None = None,
+            clear_cookie: bool = False,
+        ) -> None:
             self._send(
                 status,
                 "application/json; charset=utf-8",
                 json.dumps(value, separators=(",", ":")).encode(),
+                session_token=session_token,
+                clear_cookie=clear_cookie,
             )
 
-        def _send(self, status: int, content_type: str, body: bytes) -> None:
+        def _send(
+            self,
+            status: int,
+            content_type: str,
+            body: bytes,
+            *,
+            session_token: str | None = None,
+            clear_cookie: bool = False,
+        ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")
+            if session_token is not None:
+                self.send_header(
+                    "Set-Cookie",
+                    f"{SESSION_COOKIE}={session_token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={int(SESSION_LIFETIME.total_seconds())}",
+                )
+            elif clear_cookie:
+                self.send_header(
+                    "Set-Cookie",
+                    f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+                )
             self.end_headers()
             self.wfile.write(body)
 
@@ -1727,7 +1940,7 @@ HTML = r'''<!doctype html>
 <title>Codex Trading Simulator</title>
 <style>
 :root{color-scheme:dark;--bg:#07111f;--panel:#101d2e;--line:#24364e;--text:#ecf4ff;--muted:#92a7c1;--green:#35d07f;--amber:#f2b84b;--red:#ff6577;--blue:#63a7ff}*{box-sizing:border-box}body{margin:0;font:15px/1.5 system-ui,Segoe UI,sans-serif;background:radial-gradient(circle at top right,#11284a 0,#07111f 38%);color:var(--text);min-height:100vh}.wrap{max-width:1180px;margin:auto;padding:32px 22px}header{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:24px}h1{margin:0;font-size:clamp(25px,4vw,42px);letter-spacing:-.04em}.sub{color:var(--muted);margin-top:7px}.safety{border:1px solid #216944;background:#0c2b20;color:#a8f2c7;border-radius:999px;padding:8px 13px;font-weight:700;white-space:nowrap}.portfolio{margin-bottom:18px;background:#0c1929;border:1px solid var(--line);border-radius:17px;padding:17px 19px}.portfolio .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-top:12px}.metric{background:#101f33;border-radius:10px;padding:10px}.metric small{display:block;color:var(--muted)}.metric strong{font-size:17px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:16px}.card{background:linear-gradient(180deg,#13233a,#0e1929);border:1px solid var(--line);border-radius:17px;padding:19px;box-shadow:0 16px 42px #0005}.top{display:flex;justify-content:space-between;align-items:center}.asset{font-size:23px;font-weight:800}.badge{font-size:12px;border-radius:999px;padding:5px 9px;background:#24334a;color:var(--muted);text-transform:uppercase;font-weight:800}.badge.good{background:#123b2b;color:var(--green)}.badge.warn{background:#493617;color:var(--amber)}.badge.bad{background:#4a1e28;color:var(--red)}dl{display:grid;grid-template-columns:100px 1fr;gap:8px 10px;margin:20px 0 0}dt{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere}.reason{margin-top:17px;padding-top:14px;border-top:1px solid var(--line);color:#c7d5e7;min-height:60px}.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.actions button{border:0;border-radius:9px;padding:8px 11px;font-weight:800;cursor:pointer}.approve{background:var(--green);color:#062014}.refuse{background:var(--red);color:white}.footer{display:flex;justify-content:space-between;gap:15px;margin-top:20px;color:var(--muted);font-size:13px}.empty{opacity:.65}.error{color:var(--red)}@media(max-width:650px){header{display:block}.safety{display:inline-block;margin-top:14px}.footer{display:block}}
-</style></head><body><main class="wrap"><header><div><h1>Execution Readiness</h1><div class="sub">Local audit dashboard · BTC / ETH / SOL / XRP</div></div><div class="safety">● REAL ORDERS BLOCKED · SUPERVISED DEMO · 1×</div></header><section id="portfolio" class="portfolio"></section><section id="grid" class="grid"></section><div class="footer"><span id="updated">Waiting for audit data…</span><span>Credentials and raw broker responses are never displayed.</span></div></main>
+</style></head><body><main class="wrap"><header><div><h1>Execution Readiness</h1><div class="sub">Authenticated audit dashboard · BTC / ETH / SOL / XRP</div></div><div><div class="safety">● REAL ORDERS BLOCKED · SUPERVISED DEMO · 1×</div><button class="logout" onclick="logout()" style="float:right;margin-top:10px;border:1px solid var(--line);border-radius:8px;padding:7px 11px;background:#13233a;color:var(--text);cursor:pointer">Log out</button></div></header><section id="portfolio" class="portfolio"></section><section id="grid" class="grid"></section><div class="footer"><span id="updated">Waiting for audit data…</span><span>Credentials and raw broker responses are never displayed.</span></div></main>
 <script>
 const TOKEN='__ACTION_TOKEN__';const esc=v=>String(v??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const pct=v=>v===undefined||v===null?'—':(Number(v)*100).toFixed(2)+'%';
@@ -1735,6 +1948,7 @@ function portfolio(p,a){let automation=a?.enabled?`<span class="badge good">rout
 function card(a){let failure=a.error||a.monitor_error;let state=a.reconciliation_pending?'reconcile':failure?'monitor stopped':!a.available?'waiting':a.kill_switch?'kill switch':a.risk_active||a.automation_review_required?'review':a.ready?'intent reserved':a.holding_position?'holding':(a.decision||'observing');let cls=failure||a.kill_switch?'bad':a.reconciliation_pending||a.risk_active||a.automation_review_required?'warn':a.ready||a.holding_position?'good':'';let review=a.risk_active&&!a.kill_switch&&!a.reconciliation_pending?`<button class="approve" onclick="risk('${a.asset}','${a.risk_event_id}','approve')">Approve event</button><button class="refuse" onclick="risk('${a.asset}','${a.risk_event_id}','refuse')">Refuse & halt</button>`:'';let reenable=a.kill_switch?`<button class="approve" onclick="reenable('${a.asset}')">Re-enable</button>`:'';let abandon=a.can_rebaseline&&!a.monitor_running&&!a.reconciliation_pending?`<button class="refuse" onclick="abandonIntent('${a.asset}')">Reject intent & release reservation</button>`:'';let flat=a.can_flat_rebaseline&&!a.monitor_running?`<button class="approve" onclick="flatRebaseline('${a.asset}')">Confirm Demo flat & rebaseline</button>`:'';let close=a.intent_action==='close-entire-long-position';let add=a.intent_action==='add-long-by-cash-amount';let execute=a.can_execute_demo&&!a.kill_switch&&!a.reconciliation_pending?`<button class="refuse" onclick="executeDemo('${a.asset}','${a.intent_id}','${a.intent_amount_usd}','${a.intent_action}')">${a.automation_review_required?'Review unusual climb & DEMO sell':close?'Execute DEMO lot close':add?'Approve DEMO additional buy':'Approve & execute DEMO buy'}</button>`:'';let reconcile=a.reconciliation_pending&&!a.monitor_running?`<button class="approve" onclick="reconcileDemo('${a.asset}','${a.reconciliation_intent_id}')">Reconcile Demo result</button>`:'';let start=!a.kill_switch&&!a.monitor_running&&!a.can_rebaseline&&!a.can_flat_rebaseline&&!a.can_execute_demo&&!a.reconciliation_pending?`<button class="approve" onclick="startMonitor('${a.asset}')">Start monitoring</button>`:'';let running=a.monitor_running?`<button class="refuse" onclick="stopMonitor('${a.asset}')">Stop monitoring</button><span class="badge good">monitor running</span>`:'';let amount=a.intent_amount_usd?`${esc(a.intent_amount_usd)} USD`:'—';let allocation=a.position_allocation_usd?`${esc(a.position_allocation_usd)} USD`:'—';let reason=a.automation_review_required?a.automation_review_reason:a.reconciliation_pending?'Demo execution requires read-only reconciliation. Do not submit or retry the order.':(failure||a.reason||'No completed evaluation recorded yet.');return `<article class="card ${a.available?'':'empty'}"><div class="top"><span class="asset">${esc(a.asset)}</span><span class="badge ${cls}">${esc(state)}</span></div><dl><dt>Resolution</dt><dd>${esc(a.resolution)}</dd><dt>Candle</dt><dd>${esc(a.candle_timestamp)}</dd><dt>State</dt><dd>${esc(a.market_state)}</dd><dt>Decision</dt><dd>${esc(a.decision)}</dd><dt>Intents</dt><dd>${esc(a.intent_count)}</dd><dt>Intent amount</dt><dd>${amount}</dd><dt>Position</dt><dd>${a.holding_position?'open':'flat'}</dd><dt>Lots</dt><dd>${esc(a.position_lots)}</dd><dt>Allocation</dt><dd>${allocation}</dd><dt>Execution</dt><dd>${esc(a.execution_status)}</dd><dt>Leverage</dt><dd>1× · no borrowing</dd></dl><div class="reason ${failure&&!a.reconciliation_pending?'error':''}">${esc(reason)}</div><div class="actions">${review}${reenable}${abandon}${flat}${execute}${reconcile}${start}${running}</div></article>`}
 async function risk(asset,event,op){const actor=prompt('Operator name');if(!actor)return;if(op==='refuse'&&!confirm('Refuse this exact event and enable the local kill switch for '+asset+'?'))return;try{const r=await fetch(`/api/assets/${asset.toLowerCase()}/risk/${op}`,{method:'POST',headers:{'Content-Type':'application/json','X-Dashboard-Token':TOKEN},body:JSON.stringify({event_id:event,actor})});const d=await r.json();if(!r.ok)throw Error(d.error||'Action failed');alert(op==='approve'?'Event approved. No order was submitted.':'Event refused and kill switch enabled. No order was submitted.');await refresh()}catch(e){alert(e.message)}}
 async function post(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Dashboard-Token':TOKEN},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw Error(d.error||'Action failed');await refresh();return d}
+async function logout(){try{await fetch('/api/logout',{method:'POST',headers:{'Content-Type':'application/json','X-Dashboard-Token':TOKEN},body:'{}'})}finally{location.href='/login'}}
 async function portfolioControl(op){const actor=prompt('Operator name');if(!actor)return;const reason=prompt('Reason (required and written to the audit log)');if(!reason)return;let message=op==='kill-enable'?'Halt all new portfolio buying? Monitoring and risk-reducing closes remain available.':op==='kill-disable'?'Disable the manual portfolio kill switch? Latched loss controls remain active.':'Reset the latched portfolio loss/drawdown halt and establish a new baseline?';if(!confirm(message))return;try{await post(`/api/assets/portfolio/risk/${op}`,{actor,reason});alert('Portfolio control updated. No order was submitted.')}catch(e){alert(e.message)}}
 async function automationControl(op){const actor=prompt('Operator name');if(!actor)return;let ack='';if(op==='enable'){ack=prompt('Routine rule-based actions will submit to eToro DEMO without per-order approval. Structural drops and unusual-climb exits still pause. Real orders and leverage remain blocked. Type exactly:\nI_ENABLE_RULE_BASED_DEMO_AUTOMATION');if(ack!=='I_ENABLE_RULE_BASED_DEMO_AUTOMATION')return;if(!confirm('Enable persistent rule-based automation for the DEMO portfolio?'))return}else if(!confirm('Disable Demo automation? Existing positions and monitors are preserved.'))return;try{await post(`/api/assets/portfolio/automation/${op}`,{actor,acknowledgement:ack});alert(op==='enable'?'Routine Demo automation enabled.':'Demo automation disabled.')}catch(e){alert(e.message)}}
 async function reenable(asset){const actor=prompt('Operator name');if(!actor)return;if(!confirm('Disable the local kill switch for '+asset+'? The active risk may still require approval.'))return;try{await post(`/api/assets/${asset.toLowerCase()}/kill-switch/disable`,{actor});alert('Kill switch disabled. No order was submitted.')}catch(e){alert(e.message)}}
@@ -1744,7 +1958,7 @@ async function executeDemo(asset,intent,amount,action){const closing=action==='c
 async function reconcileDemo(asset,intent){if(!confirm(`Read the Demo portfolio and reconcile ${asset} intent ${intent}? This cannot submit or retry an order and may take up to 60 seconds.`))return;try{const d=await post(`/api/assets/${asset.toLowerCase()}/intent/reconcile-demo`,{intent_id:intent});alert(d.position_open?asset+' Demo position reconciled and recorded.':asset+' Demo close reconciled; the position is confirmed closed.');await refresh()}catch(e){alert(e.message)}}
 async function abandonIntent(asset){const actor=prompt('Operator name');if(!actor)return;if(!confirm('Reject the latest UNEXECUTED buy intent, release its reserved capacity, verify Demo is flat, and advance the '+asset+' baseline? This does not submit an order.'))return;try{const d=await post(`/api/assets/${asset.toLowerCase()}/intent/abandon-rebaseline`,{actor});alert('Intent rejected, reservation released, and '+asset+' rebaselined at '+d.baseline+'. No order was submitted.')}catch(e){alert(e.message)}}
 async function flatRebaseline(asset){const actor=prompt('Operator name');if(!actor)return;if(!confirm('Perform a fresh read-only Demo check, confirm '+asset+' has no position, preserve other assets, and reset only its replay baseline? No order will be submitted.'))return;try{const d=await post(`/api/assets/${asset.toLowerCase()}/state/rebaseline-flat`,{actor});alert(asset+' was confirmed flat and rebaselined at '+d.baseline+'. No order was submitted. You may now restart monitoring.')}catch(e){alert(e.message)}}
-async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();document.querySelector('#portfolio').innerHTML=portfolio(d.portfolio_risk,d.automation);document.querySelector('#grid').innerHTML=d.assets.map(card).join('');document.querySelector('#updated').textContent='Updated '+new Date(d.generated_at).toLocaleString()}catch(e){document.querySelector('#updated').textContent='Dashboard refresh failed: '+e.message}}
+async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});if(r.status===401){location.href='/login';return}if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();document.querySelector('#portfolio').innerHTML=portfolio(d.portfolio_risk,d.automation);document.querySelector('#grid').innerHTML=d.assets.map(card).join('');document.querySelector('#updated').textContent='Updated '+new Date(d.generated_at).toLocaleString()}catch(e){document.querySelector('#updated').textContent='Dashboard refresh failed: '+e.message}}
 async function resolveRejectedClose(asset,intent){const actor=prompt('Operator name');if(!actor)return;const phrase=prompt('The previous request displayed HTTP 400 and will NOT be retried. Type exactly:\nI_SAW_HTTP_400_REJECTION');if(phrase!=='I_SAW_HTTP_400_REJECTION')return;if(!confirm('Perform a fresh read-only check that the exact Demo position remains open with no pending order, then mark only this failed attempt rejected?'))return;try{await post(`/api/assets/${asset.toLowerCase()}/intent/resolve-rejected-close`,{actor,intent_id:intent,acknowledgement:phrase});alert('HTTP 400 attempt marked rejected after confirming the Demo position remains open. No order was submitted or retried.')}catch(e){alert(e.message)}}
 async function dismissIntent(asset,intent){const actor=prompt('Operator name');if(!actor)return;if(!confirm(`Dismiss unexecuted ${asset} trigger ${intent}? Monitoring will continue and no order will be submitted.`))return;try{await post(`/api/assets/${asset.toLowerCase()}/intent/dismiss`,{actor,intent_id:intent});alert('Trigger dismissed. Monitoring continues and no order was submitted.');await refresh()}catch(e){alert(e.message)}}
 async function addRecoveryButtons(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)return;const d=await r.json();d.assets.forEach((a,i)=>{if(a.can_resolve_rejected_close&&!a.monitor_running){const actions=document.querySelectorAll('.card')[i]?.querySelector('.actions');if(actions&&!actions.querySelector('.resolve-http-400'))actions.insertAdjacentHTML('afterbegin',`<button class="approve resolve-http-400" onclick="resolveRejectedClose('${a.asset}','${a.reconciliation_intent_id}')">Resolve HTTP 400 rejection</button>`)}})}catch(e){}}
@@ -1752,3 +1966,13 @@ async function addDismissButtons(){try{const r=await fetch('/api/status',{cache:
 async function enhance(){await addRecoveryButtons();await addDismissButtons()}
 refresh().then(enhance);setInterval(()=>refresh().then(enhance),10000);
 </script></body></html>'''
+
+
+LOGIN_HTML = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in · Codex Trading Simulator</title><style>
+:root{color-scheme:dark;--bg:#07111f;--panel:#101d2e;--line:#24364e;--text:#ecf4ff;--muted:#92a7c1;--green:#35d07f;--red:#ff6577}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;font:15px/1.5 system-ui,Segoe UI,sans-serif;background:radial-gradient(circle at top right,#11284a 0,#07111f 42%);color:var(--text)}main{width:min(420px,100%);background:linear-gradient(180deg,#13233a,#0e1929);border:1px solid var(--line);border-radius:18px;padding:30px;box-shadow:0 20px 60px #0008}h1{margin:0;font-size:30px}.sub{color:var(--muted);margin:7px 0 24px}label{display:block;margin:14px 0 6px;color:#c7d5e7}input{width:100%;border:1px solid var(--line);border-radius:9px;background:#081524;color:var(--text);padding:11px 12px;font:inherit}button{width:100%;border:0;border-radius:9px;background:var(--green);color:#062014;padding:11px;margin-top:20px;font-weight:800;cursor:pointer}.error{color:var(--red);min-height:23px;margin-top:12px}.safety{color:var(--muted);font-size:13px;border-top:1px solid var(--line);padding-top:17px;margin-top:17px}
+</style></head><body><main><h1>Execution Readiness</h1><div class="sub">Sign in to the supervised Demo dashboard</div><form id="login"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required autofocus><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button type="submit">Sign in</button><div id="error" class="error" role="alert"></div></form><div class="safety">Real orders blocked · Demo only · 1× · no borrowing</div></main><script>
+document.querySelector('#login').addEventListener('submit',async e=>{e.preventDefault();const button=e.target.querySelector('button');const error=document.querySelector('#error');button.disabled=true;error.textContent='';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:e.target.username.value,password:e.target.password.value})});const d=await r.json();if(!r.ok)throw Error(d.error||'Sign in failed');location.href='/'}catch(ex){error.textContent=ex.message;e.target.password.value='';button.disabled=false}})
+</script></body></html>'''
+
