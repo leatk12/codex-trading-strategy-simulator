@@ -788,6 +788,35 @@ python -m trading_simulator etoro-readiness-report `
 
 ## Local readiness dashboard (Version 0.19.0)
 
+Version 0.34 adds mandatory dashboard authentication. The dashboard will refuse
+to start unless `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD_HASH` are present
+in its environment. Passwords are stored as salted PBKDF2-SHA256 hashes; the
+plaintext password is never written to the repository, dashboard data directory,
+or audit logs. Successful login creates an eight-hour, in-memory session using
+an `HttpOnly`, `SameSite=Strict` cookie. Logging out revokes that session, all
+dashboard and API routes require authentication, and repeated failed logins from
+one client are temporarily throttled.
+
+Create and load credentials in the PowerShell window that will run the
+dashboard:
+
+```powershell
+$env:DASHBOARD_USERNAME = "local-operator"
+$env:DASHBOARD_PASSWORD_HASH = python -m trading_simulator dashboard-password-hash
+
+python -m trading_simulator dashboard `
+  --data-dir outputs\shadow
+```
+
+The password prompt does not echo the password. Environment variables set this
+way exist only in that PowerShell process and its children. On a server, put the
+username and hash in a root-readable service environment file rather than in a
+command, repository file, or shell history.
+
+Authentication does not make plain HTTP safe for public exposure. The server
+continues to bind only to `127.0.0.1`; access it through an SSH tunnel, or put a
+proper HTTPS reverse proxy in front of it. Do not open port 8765 to the internet.
+
 The local GUI reads the BTC, ETH, SOL, and XRP shadow/readiness/control/intent
 audit files and refreshes every ten seconds. It binds only to `127.0.0.1`,
 does not require or display API credentials, and has no order controls. An
@@ -1111,3 +1140,4 @@ allows the next poll to resume normal signal evaluation.
   volume. It also uses simple thresholds rather than statistical confidence.
 - Safeguard volatility uses unannualised simple-return dispersion and does not
   model liquidity, order-book depth, correlations, news, or fundamental events.
+
