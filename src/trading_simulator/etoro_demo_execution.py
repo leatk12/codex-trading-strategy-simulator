@@ -24,6 +24,7 @@ from .etoro_demo import (
 
 ARMING_PHRASE = "I_UNDERSTAND_THIS_SUBMITS_A_DEMO_ORDER"
 DEMO_ORDER_PATH = "/api/v2/trading/execution/demo/orders"
+DEMO_CLOSE_PATH_PREFIX = "/api/v1/trading/execution/demo/market-close-orders/positions/"
 JsonObject = Mapping[str, Any]
 WriteTransport = Callable[[str, Mapping[str, str], bytes, float], JsonObject]
 
@@ -100,7 +101,7 @@ class EtoroDemoExecutionClient:
             "x-request-id": str(uuid5(NAMESPACE_URL, intent.intent_id)),
             "content-type": "application/json",
             "accept": "application/json",
-            "user-agent": "trading-strategy-simulator/0.16.0 (armed demo only)",
+            "user-agent": "trading-strategy-simulator/0.27.0 (armed demo only)",
         }
         payload = json.dumps(dict(intent.request_body), separators=(",", ":")).encode(
             "utf-8"
@@ -112,6 +113,36 @@ class EtoroDemoExecutionClient:
         except Exception as error:
             raise EtoroDemoError(
                 f"eToro Demo submission outcome is uncertain ({type(error).__name__}); "
+                "do not retry before portfolio reconciliation"
+            ) from error
+
+    def submit_close_long(self, intent: AuditedIntent) -> JsonObject:
+        position_id = _validate_close_long_intent(intent)
+        url = f"{self.ORIGIN}{DEMO_CLOSE_PATH_PREFIX}{position_id}"
+        parsed = urlparse(url)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != "public-api.etoro.com"
+            or parsed.path != f"{DEMO_CLOSE_PATH_PREFIX}{position_id}"
+            or parsed.query
+        ):
+            raise EtoroDemoError("execution client permits only the exact Demo close URL")
+        headers = {
+            "x-api-key": self._credentials.public_key,
+            "x-user-key": self._credentials.private_key,
+            "x-request-id": str(uuid5(NAMESPACE_URL, intent.intent_id)),
+            "content-type": "application/json",
+            "accept": "application/json",
+            "user-agent": "trading-strategy-simulator/0.27.0 (armed demo only)",
+        }
+        payload = json.dumps(dict(intent.request_body), separators=(",", ":")).encode()
+        try:
+            return self._transport(url, headers, payload, self._timeout)
+        except EtoroDemoError:
+            raise
+        except Exception as error:
+            raise EtoroDemoError(
+                f"eToro Demo close outcome is uncertain ({type(error).__name__}); "
                 "do not retry before portfolio reconciliation"
             ) from error
 
@@ -176,6 +207,95 @@ class ExecutionLedger:
             }
         )
 
+    def record_rejection(
+        self, intent_id: str, *, reason: str, confirmed_by: str
+    ) -> None:
+        if any(
+            row.get("intent_id") == intent_id
+            and row.get("status") == "request_rejected"
+            for row in self._rows()
+        ):
+            return
+        self._append(
+            {
+                "schema_version": 1,
+                "intent_id": intent_id,
+                "recorded_at": datetime.now(UTC).isoformat(),
+                "environment": "etoro_demo",
+                "status": "request_rejected",
+                "order_submitted": False,
+                "reason": reason,
+                "confirmed_by": confirmed_by,
+                "leverage": 1,
+                "real_account_allowed": False,
+            }
+        )
+
+    def assert_submitted(self, intent_id: str) -> None:
+        rows = [row for row in self._rows() if row.get("intent_id") == intent_id]
+        if not rows:
+            raise EtoroDemoError("intent has no execution-ledger attempt")
+        if rows[-1].get("status") == "request_rejected":
+            raise EtoroDemoError("intent request was rejected and cannot be reconciled")
+        if not any(
+            row.get("status") in {"attempting", "response_received"}
+            for row in rows
+        ):
+            raise EtoroDemoError("intent ledger has no submission attempt")
+
+    def has_attempt(self, intent_id: str) -> bool:
+        return any(
+            row.get("intent_id") == intent_id
+            and row.get("status") in {"attempting", "response_received", "position_reconciled"}
+            for row in self._rows()
+        )
+
+    def record_reconciliation(
+        self, intent_id: str, position: Mapping[str, Any]
+    ) -> None:
+        if any(
+            row.get("intent_id") == intent_id
+            and row.get("status") == "position_reconciled"
+            for row in self._rows()
+        ):
+            return
+        self._append(
+            {
+                "schema_version": 1,
+                "intent_id": intent_id,
+                "recorded_at": datetime.now(UTC).isoformat(),
+                "environment": "etoro_demo",
+                "status": "position_reconciled",
+                "position": dict(position),
+                "order_submitted": True,
+                "leverage": 1,
+                "real_account_allowed": False,
+            }
+        )
+
+    def record_close_reconciliation(
+        self, intent_id: str, position: Mapping[str, Any]
+    ) -> None:
+        if any(
+            row.get("intent_id") == intent_id
+            and row.get("status") == "position_closed"
+            for row in self._rows()
+        ):
+            return
+        self._append(
+            {
+                "schema_version": 1,
+                "intent_id": intent_id,
+                "recorded_at": datetime.now(UTC).isoformat(),
+                "environment": "etoro_demo",
+                "status": "position_closed",
+                "order_submitted": True,
+                "position": dict(position),
+                "leverage": 1,
+                "real_account_allowed": False,
+            }
+        )
+
     def _append(self, row: Mapping[str, Any]) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,7 +333,7 @@ def _validate_open_long_intent(intent: AuditedIntent) -> None:
         raise EtoroDemoError("Demo intent contains unexpected or missing request fields")
     if intent.request_path_template != DEMO_ORDER_PATH:
         raise EtoroDemoError("intent does not target the exact Demo order endpoint")
-    if intent.action != "open-long-by-cash-amount":
+    if intent.action not in {"open-long-by-cash-amount", "add-long-by-cash-amount"}:
         raise EtoroDemoError("only audited open-long intents are executable")
     if (
         body["action"] != "open"
@@ -231,6 +351,27 @@ def _validate_open_long_intent(intent: AuditedIntent) -> None:
         raise EtoroDemoError("intent amount is invalid") from error
     if not amount.is_finite() or amount <= 0:
         raise EtoroDemoError("intent amount is invalid")
+
+
+def _validate_close_long_intent(intent: AuditedIntent) -> int:
+    if intent.action != "close-entire-long-position":
+        raise EtoroDemoError("only audited full-position close intents are executable")
+    if set(intent.request_body) != {"InstrumentId", "UnitsToDeduct"}:
+        raise EtoroDemoError("Demo close intent must close the entire position")
+    if intent.request_body["UnitsToDeduct"] is not None:
+        raise EtoroDemoError("Demo close intent must close the entire position")
+    try:
+        instrument_id = int(intent.request_body["InstrumentId"])
+    except (TypeError, ValueError) as error:
+        raise EtoroDemoError("Demo close intent instrument ID is invalid") from error
+    if instrument_id <= 0 or isinstance(intent.request_body["InstrumentId"], bool):
+        raise EtoroDemoError("Demo close intent instrument ID is invalid")
+    if not intent.request_path_template.startswith(DEMO_CLOSE_PATH_PREFIX):
+        raise EtoroDemoError("close intent does not target the Demo close endpoint")
+    raw = intent.request_path_template[len(DEMO_CLOSE_PATH_PREFIX):]
+    if not raw.isdigit() or int(raw) <= 0 or "/" in raw:
+        raise EtoroDemoError("close intent position ID is invalid")
+    return int(raw)
 
 
 def _post_json(

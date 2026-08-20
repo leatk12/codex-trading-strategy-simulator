@@ -35,6 +35,10 @@ class AssetProfile:
     staged_reentry_profit_rate: Decimal
     observation_period_hours: int
     maximum_position_size: Decimal
+    scale_in_allocation_rate: Decimal
+    scale_in_pullback_rate: Decimal
+    scale_in_above_entry_hours: int
+    maximum_scale_in_tranches: int
     structural_breakdown_rate: Decimal
     structural_peak_drawdown_rate: Decimal
     structural_range_lookback_hours: int
@@ -57,6 +61,10 @@ class AssetProfile:
             raise ConfigurationError(
                 "maximum_position_size must be at least initial_investment"
             )
+        if self.scale_in_above_entry_hours <= 0:
+            raise ConfigurationError("scale_in_above_entry_hours must be greater than zero")
+        if self.maximum_scale_in_tranches < 0:
+            raise ConfigurationError("maximum_scale_in_tranches must not be negative")
         if self.rapid_appreciation_window_hours <= 0:
             raise ConfigurationError(
                 "rapid_appreciation_window_hours must be greater than zero"
@@ -92,6 +100,8 @@ class AssetProfile:
             "reentry_at_previous_buy_rate",
             "conservative_reentry_profit_rate",
             "staged_reentry_profit_rate",
+            "scale_in_allocation_rate",
+            "scale_in_pullback_rate",
             "structural_breakdown_rate",
             "structural_peak_drawdown_rate",
             "structural_range_break_rate",

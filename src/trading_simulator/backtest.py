@@ -32,6 +32,7 @@ class Backtest:
         risk_policy: StructuralBreakdownPolicy | None = None,
         manual_approval_at: datetime | None = None,
         manual_approval_times: tuple[datetime, ...] = (),
+        trading_start_after: datetime | None = None,
     ) -> None:
         if data.symbol != profile.symbol:
             raise BacktestError(
@@ -53,6 +54,9 @@ class Backtest:
             raise BacktestError("manual approval timestamps must be unique and ordered")
         self.manual_approval_at = manual_approval_at
         self.manual_approval_times = approvals
+        if trading_start_after is not None and trading_start_after.tzinfo is None:
+            raise BacktestError("trading start timestamp must include a timezone")
+        self.trading_start_after = trading_start_after
         self.starting_capital = (
             profile.initial_investment
             if starting_capital is None
@@ -70,6 +74,29 @@ class Backtest:
         for snapshot in self.data:
             history.append(snapshot)
             assessment = self.state_classifier.classify(history, previous_state)
+            if (
+                self.trading_start_after is not None
+                and snapshot.timestamp <= self.trading_start_after
+            ):
+                decisions.append(
+                    Decision(
+                        action=Action.HOLD,
+                        state=assessment.state,
+                        timestamp=snapshot.timestamp,
+                        price=snapshot.close,
+                        reason=(
+                            "Historical warm-up candle; live trading begins only "
+                            "after the broker-aligned baseline."
+                        ),
+                        facts={
+                            "live_warmup": "true",
+                            "market_state_transition": assessment.transition,
+                            "market_state_reason": assessment.reason,
+                        },
+                    )
+                )
+                previous_state = assessment.state
+                continue
             manual_approved = False
             if (
                 runtime.manual_review_active

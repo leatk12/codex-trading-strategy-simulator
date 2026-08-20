@@ -95,6 +95,7 @@ class EtoroDryRunner:
         candle_count: int,
         manual_approval_at: datetime | None = None,
         manual_approval_times: tuple[datetime, ...] = (),
+        trading_start_after: datetime | None = None,
     ) -> EtoroDryRunResult:
         clean_symbol = symbol.strip()
         if not clean_symbol:
@@ -128,12 +129,23 @@ class EtoroDryRunner:
             )
         try:
             data = HistoricalMarketData(completed)
+            if (
+                trading_start_after is not None
+                and trading_start_after < data[0].timestamp
+            ):
+                raise EtoroDemoError(
+                    "live-state baseline is older than the downloaded candle "
+                    "window; increase --candles before monitoring"
+                )
             result = Backtest(
                 profile,
                 data,
                 manual_approval_at=manual_approval_at,
                 manual_approval_times=manual_approval_times,
+                trading_start_after=trading_start_after,
             ).run()
+        except EtoroDemoError:
+            raise
         except (MarketDataError, BacktestError, ValueError) as error:
             raise EtoroDemoError(f"could not run the local replay: {error}") from error
 

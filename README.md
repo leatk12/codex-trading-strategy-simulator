@@ -1,5 +1,29 @@
 # Trading Strategy Simulator — Milestones 1–11
 
+## Supervised Demo automation (Version 0.33.0)
+
+The localhost dashboard can now opt into persistent, rule-based automation for
+the **eToro Demo portfolio only**.  Automation does not create decisions: it
+may execute only an existing, deterministic, audited readiness intent after
+all asset and portfolio checks have passed.  It then performs read-only
+reconciliation and resumes that asset's monitor.
+
+The operator is still required when:
+
+- a structural-breakdown or manual-review event detects an unusual drop;
+- an exit is generated in `EXPLOSIVE_MOMENTUM`, representing an unusual rapid
+  climb whose configured trailing sell should be confirmed;
+- the local and Demo portfolio states disagree, an order is pending, data is
+  stale, a risk cap is reached, or an execution result is uncertain.
+
+The coordinator never retries an order.  The write-ahead execution ledger,
+Demo-only URLs, 1× leverage validator, per-asset/portfolio limits and global
+kill switch remain independent safety boundaries.  Automation is disabled by
+default and must be explicitly enabled in the dashboard with the displayed
+acknowledgement phrase.  Its state and actions are recorded in
+`outputs/shadow/demo-automation-state.json` and
+`outputs/shadow/demo-automation-audit.jsonl`.
+
 This is the project foundation, historical OHLCV data layer, and simulated
 portfolio-accounting layer for an educational, deterministic backtester. It
 does **not** connect to an exchange. Example
@@ -636,6 +660,23 @@ python -m trading_simulator etoro-shadow-kill-switch `
 
 ## Demo execution-readiness intents (Version 0.14.0)
 
+For an immediate, completely offline check of the intent-writing path, use:
+
+```powershell
+python -m trading_simulator test-intent-pipeline `
+  --config configs\xrp_example.toml `
+  --output-dir outputs\synthetic-intent-test
+```
+
+This injects a fixed synthetic BUY into the same constraints and reconciliation
+builder used by readiness monitoring. It makes no API call, requires no eToro
+credentials, and writes only under the supplied output directory. Its audit is
+marked `environment=synthetic_test` and `execution_eligible=false`; the Demo
+execution reader explicitly rejects it. Repeating the command during the same
+hour reports `intent_written=false` because the synthetic intent is
+deterministically deduplicated. This tests software plumbing, not strategy
+quality or the existence of a live market signal.
+
 The readiness command reconciles the latest approved strategy replay with the
 read-only eToro Demo P&L response and, only when a buy or close decision is
 fully consistent, appends a non-executing request intent to JSONL:
@@ -684,7 +725,59 @@ It polls every 60 seconds but appends only one readiness evaluation per
 completed candle. It halts safely on stale data, an active review, kill-switch
 activation, pending orders, portfolio mismatch, unknown/multiple/copy
 positions, leveraged or short exposure, and failed order constraints. API or
-audit failures also halt rather than being ignored. No execution method exists.
+audit failures also halt rather than being ignored. The readiness loop itself
+has no execution method.
+
+### Broker-aligned live baseline (Version 0.20.0)
+
+The readiness and supervised Demo-intent commands no longer treat positions
+created by the historical indicator replay as real holdings. On the first run
+for an asset, the adapter verifies that the Demo portfolio is flat and has no
+pending orders, then writes `ASSET-one-hour.live-state.json`. Its candle
+timestamp is an immutable live baseline. Candles at or before that timestamp
+remain available to the market-state classifier, but are warm-up observations
+and cannot buy or sell. Only a newly completed candle after the baseline can
+produce the first live intent.
+
+The checkpoint identity includes strategy version, profile symbol, requested
+eToro symbol, instrument ID, and candle resolution. Reusing it for a different
+asset or timeframe is rejected. If the baseline eventually falls outside the
+requested candle window, monitoring halts and asks for a larger `--candles`
+value instead of silently losing live transaction history.
+After the baseline, every readiness decision is still reconciled against the
+current Demo P&L response; an unexplained flat/long difference halts the
+monitor. A new checkpoint is deliberately refused when a broker position is
+already open because guessing its entry basis would make exit decisions
+unsafe. Use `--live-state PATH` only when an explicit alternative checkpoint
+location is required. Do not delete a checkpoint merely to bypass a
+reconciliation failure.
+
+Three additional educational profiles are provided for a broader read-only
+watchlist: `eth_example.toml`, `sol_example.toml`, and `xrp_example.toml`.
+eToro's current market pages identify ETH, SOL, and XRP, but the authenticated
+instrument lookup remains authoritative for the exact Demo account and region.
+Run each monitor in its own PowerShell window with isolated logs. For example,
+replace `ASSET` and `SYMBOL` with `eth`/`ETH`, `sol`/`SOL`, or `xrp`/`XRP`:
+
+```powershell
+python -m trading_simulator etoro-readiness-loop `
+  --config configs\ASSET_example.toml `
+  --symbol SYMBOL `
+  --resolution one-hour `
+  --candles 200 `
+  --shadow-log outputs\shadow\ASSET-one-hour.jsonl `
+  --readiness-log outputs\shadow\ASSET-readiness.jsonl `
+  --intent-log outputs\shadow\ASSET-intents.jsonl `
+  --minimum-order-usd 10.00 `
+  --amount-increment-usd 0.01 `
+  --poll-seconds 300
+```
+
+This increases the number of genuine observations without relaxing strategy
+thresholds. It does not make any individual signal better. Stop and review all
+monitors as soon as one writes an intent; never execute competing intents from
+the same portfolio. Execution remains blocked in every readiness monitor and
+all profiles retain the explicit 1x/no-borrowing rule.
 
 After collecting observations, print a readiness report:
 
@@ -692,6 +785,184 @@ After collecting observations, print a readiness report:
 python -m trading_simulator etoro-readiness-report `
   --readiness-log outputs\shadow\btc-readiness.jsonl
 ```
+
+## Local readiness dashboard (Version 0.19.0)
+
+The local GUI reads the BTC, ETH, SOL, and XRP shadow/readiness/control/intent
+audit files and refreshes every ten seconds. It binds only to `127.0.0.1`,
+does not require or display API credentials, and has no order controls. An
+active manual-review event exposes two exact-event controls: **Approve event**
+records the same scoped approval as the CLI, while **Refuse & halt** enables
+that asset's local kill switch. Both require an operator name, revalidate that
+the event has not changed, and submit no broker order. The server uses a random
+per-session action token and accepts these mutations only through its JSON API.
+When a kill switch is active, **Re-enable** explicitly disables it for that
+asset. **Start monitoring** launches one matching readiness-loop child process
+using the dashboard process's inherited eToro environment variables; duplicate
+dashboard-owned monitors are rejected. Child output is written to
+`ASSET-dashboard-monitor.log`, and all dashboard-owned monitors are terminated
+when the dashboard stops. If the dashboard was started without the two eToro
+environment variables, the start action fails without exposing credentials.
+
+Version 0.25 adds bounded resilience for read-only broker connectivity. A
+readiness monitor retries up to five consecutive transient connection or timeout
+errors, without writing an intent or submitting an order. Safety, kill-switch,
+and reconciliation failures still halt immediately. If a dashboard-owned child
+monitor exits, its final `HALTED safely` message is displayed on that asset card
+beside the button that can start a fresh monitor.
+
+Version 0.26 adds supervised Demo execution to the local dashboard. An asset
+card exposes **Execute DEMO order** only for the latest unattempted, execution-
+eligible audited intent and only after its monitor has stopped. The operator
+must supply a name, an explicit USD cap (with a hard dashboard ceiling of
+1000.00 USD), the exact Demo arming phrase, and a final confirmation. The
+dashboard then invokes the existing Demo-only execution command, which
+revalidates the live portfolio, strategy decision, payload and intent ID before
+writing its attempt ledger and contacting the exact Demo endpoint. Leverage is
+fixed at 1x, real-account access remains structurally blocked, and an uncertain
+submission cannot be retried. Each card also has an explicit **Stop monitoring**
+control so execution cannot race the readiness loop.
+
+Version 0.26.1 permits only the one-cent downward execution-rounding difference
+observed when eToro represented a 1000.00 USD Demo cash order as a 999.99 USD
+open position. Reconciliation records the broker's actual amount. Any larger
+shortfall, any overfill, another instrument, a short, or leverage still fails
+closed as an altered fill.
+
+Version 0.27 adds simultaneous multi-asset Demo holdings. Every readiness loop,
+live checkpoint, and reconciliation operation now selects positions by that
+asset's resolved `instrumentId`; unrelated long positions no longer halt the
+monitor. Portfolio-wide safeguards still reject copy exposure, pending-order
+ambiguity, every short, and leverage other than 1x. More than one position for
+the same instrument remains ambiguous and fails closed. Dashboard write actions
+are serialized so two asset submissions cannot race the shared Demo cash
+balance.
+
+The same milestone adds separately armed full-position Demo closes. A sell
+decision creates an audited close intent containing the exact broker position
+ID and `{ "UnitsToDeduct": null }`. After monitoring is stopped, the dashboard
+shows **Execute DEMO full close** and requires the same operator, arming phrase,
+confirmation, write-ahead ledger, current-state revalidation, and no-retry
+policy used for buys. The reconciliation command handles both opens and closes;
+for a close it waits until that exact position disappears, allows other assets
+to remain open, records `position_closed`, and clears only that asset's live
+checkpoint.
+
+Version 0.28 completes the dashboard's post-submission lifecycle. Each asset
+card summarises its sanitised execution-ledger status and detects both
+`attempting` and `response_received` intents that have no terminal
+`position_reconciled` or `position_closed` record. Such a card exposes
+**Reconcile Demo result**, suppresses execution and restart controls, and
+explains that the order must not be retried. The server also enforces those
+blocks independently of the browser.
+
+The reconciliation button invokes only the existing read-only Demo P&L
+reconciler, with a bounded 60-second poll. It can neither submit nor retry an
+order. A successful buy reconciliation records the exact instrument-scoped
+position; a successful close reconciliation confirms that exact position has
+disappeared while preserving other assets. Timeouts and safety mismatches keep
+the reconciliation control available for a later read-only attempt.
+
+Version 0.29 adds one shared, cash-only portfolio risk controller across every
+asset monitor. Its policy is declared in `configs/portfolio_risk.toml`. The
+default limits are 1,000 USD per asset, 4,000 USD total exposure, a 1,000 USD
+minimum cash reserve, four simultaneously open assets, a 5% UTC-day loss
+limit, and a 10% peak-to-current drawdown limit. No borrowing is permitted:
+every observed Demo position must be long, unique by instrument, positive, and
+exactly 1x or the gate fails closed.
+
+The controller serialises all monitor decisions through one atomic
+`outputs/shadow/portfolio-risk-state.json` file, so parallel asset monitors do
+not independently allocate the same remaining capacity. It checks new buys
+during readiness and repeats the check immediately before separately armed
+Demo execution. Allocation approvals and rejections are appended to
+`portfolio-risk-decisions.jsonl`. Daily-loss and drawdown breaches latch across
+later price recovery until an operator explicitly resets them. A manual global
+kill switch also blocks all new buys. Both kinds of halt continue to allow
+monitoring and risk-reducing full closes.
+
+The dashboard shows cash, total and remaining exposure, open-asset count,
+daily loss, drawdown, reserve and per-asset limits. It also provides audited
+controls to enable or disable the manual global kill switch and to reset a
+latched loss/drawdown halt. Each control requires an operator name, reason and
+confirmation, writes `portfolio-risk-controls.jsonl`, submits no order, and
+does not weaken the permanent 1x/no-borrowing rule. Restart the dashboard and
+each monitor after installing this version; the portfolio panel remains in a
+safe waiting state until the first successful Demo observation.
+
+Version 0.30 makes portfolio capacity reservations atomic across simultaneous
+asset monitors. When a buy passes readiness, its exact intent ID reserves its
+cash amount in the shared portfolio state before the intent is exposed for
+operator action. Later monitors include all other live reservations when they
+check total exposure, cash reserve and the open-asset limit. Rechecking the
+same intent immediately before Demo execution is idempotent and cannot reserve
+the amount twice.
+
+The default reservation lifetime is 180 minutes and is configured with
+`reservation_ttl_minutes` in `configs/portfolio_risk.toml`. Expired
+reservations are removed on the next successful portfolio observation. A
+matching reconciled Demo position consumes its reservation, while **Reject
+intent & release reservation** verifies that the instrument is flat, records
+the rejection, advances that asset's baseline and releases the capacity. The
+dashboard separates invested exposure from reserved intent exposure and shows
+both the reserved amount and reservation count. Every approval, rejection,
+expiry and consumption transition remains in `portfolio-risk-decisions.jsonl`.
+
+Version 0.30.1 distinguishes a strategy risk event from a flat-state replay
+mismatch. The latter previously stopped the monitor with a generic operator
+review message even though there was no event to approve. The dashboard now
+shows its exact cause and offers **Confirm Demo flat & rebaseline**. This
+read-only action verifies that the selected instrument has no Demo position,
+that there are no pending orders or copy exposure, preserves positions in all
+other instruments, advances only that asset's baseline, and appends an
+immutable `*-flat-rebaselines.jsonl` audit record. It cannot submit an order.
+
+Version 0.30.2 corrects the Demo full-close payload to include the required
+`InstrumentId` alongside `UnitsToDeduct: null`. A deterministic HTTP 4xx
+response is now recorded as `request_rejected` rather than remaining an
+ambiguous submission forever. For the single pre-fix XRP attempt, the dashboard
+offers **Resolve HTTP 400 rejection**. It requires the exact acknowledgement
+phrase, performs a fresh read-only check that the same long 1x position remains
+open and no order is pending, then marks only that attempt rejected. It never
+retries the request. A later sell decision creates a new, corrected close
+intent with a different cryptographic identity.
+
+```powershell
+python -m trading_simulator dashboard `
+  --data-dir outputs\shadow
+```
+
+The browser opens at `http://127.0.0.1:8765/`. Keep the PowerShell process
+running while using the GUI and press Ctrl+C to stop it. Use `--no-browser` if
+you want to open the URL manually, or `--port 8766` if the default port is in
+use. Monitoring itself remains non-executing. Dashboard submission is available
+only through the separately armed Demo control; real-account access remains
+blocked, and every card explicitly reports 1x/no borrowing.
+
+Version 0.23 changes only the dashboard-managed XRP stream to completed
+15-minute candles. XRP uses 800 candles (200 hours of history), polls every 60
+seconds, and writes isolated `xrp-fifteen-minutes*` audit/checkpoint files; its
+older hourly records remain untouched. The persistent-decline threshold is
+scaled from 6 hourly candles to 24 fifteen-minute candles so that safeguard
+still spans six hours. Other time windows are already expressed in hours. BTC,
+ETH, and SOL remain hourly. This increases XRP decision opportunities but does
+not establish that 15 minutes is an optimal or profitable resolution.
+Dashboard-started monitors run Python in unbuffered mode, so their status is
+written immediately to the matching `*-dashboard-monitor.log` file. Child
+status is intentionally not echoed into the PowerShell window that hosts the
+dashboard; that window reports only the web server lifecycle.
+
+Version 0.24 adds **Abandon intent & rebaseline** to every asset card when an
+unexecuted intent has left the replay position inconsistent with Demo. The
+asset monitor must already be stopped. The action requires an operator name,
+checks that the latest audit is an execution-eligible Demo intent still marked
+unsubmitted, rejects any attempt found in the conventional execution ledger,
+and performs a fresh authenticated Demo P&L read. It proceeds only when there
+are no positions, pending orders, or copy/mirror exposure. Before atomically
+advancing the live checkpoint, it appends an immutable record to the asset's
+`*-abandonments.jsonl` audit. Existing shadow, readiness, and intent records are
+never deleted. This control cannot submit, cancel, or retry an order and always
+retains the 1x/no-borrowing invariant.
 
 The current public documentation clearly identifies instrument discovery and
 the unified Demo order shape, but it does not expose a stable, clearly
@@ -701,11 +972,11 @@ and must be independently checked before any execution work.
 
 ## Explicitly armed Demo execution (Version 0.16.0)
 
-Version 0.16 adds a separate write client that accepts only the exact unified
-Demo URL `/api/v2/trading/execution/demo/orders`. It rejects the real route,
-other hosts, redirects, altered payloads, shorts, sells, leverage other than 1,
-and every action except an audited cash-amount long buy. It is never called by
-either continuous loop.
+Version 0.16 added the separate Demo buy client. Version 0.27 extends the same
+client to the documented Demo full-close route. It accepts only the exact Demo
+buy URL or an exact Demo position-close URL, rejects real routes, other hosts,
+redirects, shorts, leverage, partial closes, and unaudited payloads. It is never
+called by either continuous loop.
 
 Execution is intentionally unavailable until the readiness monitor has created
 an intent. For a selected intent, the supervised command reloads the audit,
@@ -714,6 +985,36 @@ ID and payload to match exactly, applies a separate maximum Demo order amount,
 and requires the literal arming phrase. It writes `attempting` to an execution
 ledger before the network request. Any ledger entry blocks automatic retry,
 including after a timeout or uncertain response.
+
+### Post-submission Demo reconciliation (Version 0.22.0)
+
+After an explicitly armed Demo intent has been submitted, do not submit it
+again. Reconcile the resulting position instead:
+
+```powershell
+python -m trading_simulator etoro-demo-reconcile-execution `
+  --intent-log outputs\shadow\xrp-intents.jsonl `
+  --intent-id YOUR_INTENT_ID `
+  --execution-ledger outputs\shadow\xrp-execution.jsonl `
+  --live-state outputs\shadow\xrp-one-hour.live-state.json `
+  --poll-seconds 5 `
+  --timeout-seconds 60
+```
+
+This command cannot submit or retry an order. It proves the intent belongs to
+the Demo environment and that its ledger contains a submission attempt, then
+polls only the Demo P&L endpoint. Opens confirm one exact position for the
+intended instrument and cash amount at leverage 1; closes confirm that exact
+position has disappeared. Other assets may remain open. Duplicate positions for
+the same instrument, shorts, leverage, altered fills, copy exposure, or pending
+orders halt safely.
+
+On success, the ledger receives one idempotent `position_reconciled` record and
+the live checkpoint is atomically bound to the position ID, amount, units, and
+open rate. Broker fees are stored when Demo P&L exposes them; otherwise the
+audit records `not_exposed_by_demo_pnl` rather than inventing a value. Every
+later readiness cycle verifies that recorded position. A timeout never retries
+the order and instructs the operator to reconcile again later.
 
 ```powershell
 python -m trading_simulator etoro-demo-execute-intent `
@@ -745,6 +1046,42 @@ IDs, or individual holdings. Equity follows eToro's documented formula of
 available cash plus total invested plus unrealised P&L. The key should have only
 `Trading — Demo: Read` and `Market Data: Read` permissions.
 
+## Controlled additional buys and multi-lot positions (Version 0.31.0)
+
+Each asset profile now defines an explicit additional-buy allocation rate,
+pullback threshold, above-entry observation period, and maximum number of
+additional tranches. The example policy allocates at most 25% of the asset's
+`maximum_position_size` per additional purchase. A purchase is eligible only
+when the strategy has a BUY signal and the market is stabilising or recovering,
+plus either:
+
+- price is at least 2% below the weighted entry price; or
+- price has remained in qualifying above-entry stabilisation for 48 completed
+  hours.
+
+Every proposed amount is bounded by remaining per-asset capacity, available
+cash, the shared portfolio-risk limits, and the configured order increment.
+It remains an audited, manually approved eToro Demo order at 1x with no
+borrowing. eToro represents additions as separately closable positions, so the
+live checkpoint records every position ID. A later sell cycle closes and
+reconciles one recorded lot at a time and stays latched until all lots close.
+
+The example shared portfolio policy permits up to 2500 USD exposure per asset
+while retaining the separate 4000 USD total-portfolio ceiling.
+
+## Continuous monitoring with supervised execution (Version 0.32.0)
+
+An unattempted Demo buy or close trigger is now durably latched while the
+read-only monitor continues polling. Later candles cannot silently replace the
+pending operator decision. The dashboard can approve the intent without a
+manual stop: it pauses only that asset monitor immediately before the armed
+write, keeps it stopped while broker reconciliation is pending, and restarts it
+after successful reconciliation. Other asset monitors are unaffected.
+
+Operators can instead choose **Dismiss trigger · keep monitoring**. This records
+the refusal, releases any reserved portfolio capacity, submits no order, and
+allows the next poll to resume normal signal evaluation.
+
 ## Current limitations
 
 - Market states, momentum trailing exits, staged re-entry, and latched
@@ -754,8 +1091,9 @@ available cash plus total invested plus unrealised P&L. The key should have only
   omitted; that policy needs to be configurable rather than assumed.
 - CSV and one-shot read-only eToro candle downloads are supported. No live
   trading or continuous bot loop is present.
-- One portfolio holds at most one long asset. Leverage, short selling,
-  borrowing, margin, derivatives, and leveraged tokens are prohibited.
+- The Demo portfolio may hold one long 1x position per configured asset.
+  Duplicate same-instrument positions, leverage, short selling, borrowing,
+  margin, derivatives, and leveraged tokens are prohibited.
 - Costs are configurable fixed-rate estimates. Real spreads and slippage vary
   over time and with liquidity and order size.
 - Exchange tick sizes, quantity increments, minimum orders, taxes, currency
