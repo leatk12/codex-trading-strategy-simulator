@@ -24,6 +24,7 @@ def test_example_profile_loads_exact_decimal_values() -> None:
         ("eth_example.toml", "ETH-USD", "ETH-v1.0"),
         ("sol_example.toml", "SOL-USD", "SOL-v1.0"),
         ("xrp_example.toml", "XRP-USD", "XRP-v1.1-15m"),
+        ("lac_example.toml", "LAC-USD", "LAC-equity-v1.0"),
     ],
 )
 def test_additional_watchlist_profiles_are_independent(
@@ -37,6 +38,9 @@ def test_additional_watchlist_profiles_are_independent(
     assert profile.maximum_position_size == Decimal("2500.00")
     if symbol == "XRP-USD":
         assert profile.persistent_decline_candles == 24
+    if symbol == "LAC-USD":
+        assert profile.market_state_lookback_hours == 24
+        assert profile.observation_period_hours == 168
 
 
 def test_position_limit_cannot_be_below_initial_investment() -> None:
@@ -77,3 +81,4 @@ def test_position_limit_cannot_be_below_initial_investment() -> None:
 
     with pytest.raises(ConfigurationError, match="maximum_position_size"):
         AssetProfile(**values)
+
