@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
+import webbrowser
 from dataclasses import replace
-from collections.abc import Sequence
-from datetime import datetime, timedelta
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -14,15 +16,23 @@ from .analytics import PerformanceAnalyzer
 from .audit import AuditExporter, AuditExportError
 from .backtest import Backtest
 from .config import load_asset_profile
-from .domain import Action, Decision, MarketState
+from .domain import Action, Decision, MarketSnapshot, MarketState
+from .dashboard import serve_dashboard
 from .experiments import (
     ExperimentCase,
     ExperimentError,
     OutOfSampleSplitter,
     ParameterExperiment,
 )
-from .etoro_demo import EtoroCredentials, EtoroDemoError, EtoroDemoReadOnlyClient
-from .etoro_shadow import EtoroDryRunner, RESOLUTIONS
+from .etoro_demo import (
+    EtoroCredentials,
+    EtoroDemoError,
+    EtoroDemoPortfolioSummary,
+    EtoroDemoReadOnlyClient,
+)
+from .etoro_shadow import EtoroDryRunner, EtoroDryRunResult, RESOLUTIONS
+from .etoro_live_state import EtoroLiveStateStore
+from .etoro_reconciliation import reconcile_closed_long, reconcile_open_long
 from .etoro_shadow_loop import EtoroShadowRecorder
 from .etoro_intent import (
     EtoroIntentBuilder,
@@ -36,10 +46,15 @@ from .etoro_demo_execution import (
     ExecutionLedger,
     IntentAuditReader,
 )
-from .shadow_control import ShadowControlStore, load_latest_risk_event
+from .shadow_control import (
+    ShadowControlState,
+    ShadowControlStore,
+    load_latest_risk_event,
+)
 from .market_data import CsvMarketDataLoader, MarketDataError
 from .market_states import MarketStateClassifier
 from .portfolio import Portfolio
+from .portfolio_risk import PortfolioRiskController, load_portfolio_risk_policy
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -229,6 +244,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     intent_parser.add_argument("--candles", required=True, type=int)
     intent_parser.add_argument("--shadow-log", required=True)
+    intent_parser.add_argument(
+        "--live-state",
+        help="broker-aligned live-state checkpoint (defaults beside shadow log)",
+    )
     intent_parser.add_argument("--control")
     intent_parser.add_argument("--intent-log", required=True)
     intent_parser.add_argument(
@@ -240,6 +259,13 @@ def _build_parser() -> argparse.ArgumentParser:
     intent_parser.add_argument(
         "--max-candle-age-minutes", type=int, default=90
     )
+    intent_parser.add_argument(
+        "--portfolio-risk-config", default="configs/portfolio_risk.toml"
+    )
+    intent_parser.add_argument(
+        "--portfolio-risk-state",
+        help="shared portfolio-risk JSON state (defaults beside shadow logs)",
+    )
 
     readiness_parser = subparsers.add_parser(
         "etoro-readiness-loop",
@@ -250,9 +276,19 @@ def _build_parser() -> argparse.ArgumentParser:
             continue
         readiness_parser._add_action(action)
     readiness_parser.add_argument("--intent-log", required=True)
+    readiness_parser.add_argument(
+        "--execution-ledger",
+        help="execution ledger used to latch an unattempted intent",
+    )
     readiness_parser.add_argument("--readiness-log", required=True)
     readiness_parser.add_argument("--poll-seconds", type=int, default=60)
     readiness_parser.add_argument("--max-cycles", type=int)
+    readiness_parser.add_argument(
+        "--max-consecutive-read-errors",
+        type=int,
+        default=5,
+        help="retry this many consecutive transient read failures before halting",
+    )
     readiness_report_parser = subparsers.add_parser(
         "etoro-readiness-report",
         help="summarise a continuous readiness JSONL audit",
@@ -271,6 +307,37 @@ def _build_parser() -> argparse.ArgumentParser:
     execute_parser.add_argument("--execution-ledger", required=True)
     execute_parser.add_argument("--max-demo-order-usd", required=True, type=Decimal)
     execute_parser.add_argument("--arm-demo-execution", required=True)
+    reconcile_parser = subparsers.add_parser(
+        "etoro-demo-reconcile-execution",
+        help="read Demo P&L until one submitted intent becomes an exact position",
+    )
+    reconcile_parser.add_argument("--intent-log", required=True)
+    reconcile_parser.add_argument("--intent-id", required=True)
+    reconcile_parser.add_argument("--execution-ledger", required=True)
+    reconcile_parser.add_argument("--live-state", required=True)
+    reconcile_parser.add_argument("--poll-seconds", type=int, default=5)
+    reconcile_parser.add_argument("--timeout-seconds", type=int, default=60)
+    reconcile_parser.add_argument(
+        "--portfolio-risk-config", default="configs/portfolio_risk.toml"
+    )
+    reconcile_parser.add_argument(
+        "--portfolio-risk-state",
+        default="outputs/shadow/portfolio-risk-state.json",
+    )
+    dashboard_parser = subparsers.add_parser(
+        "dashboard", help="serve the local read-only readiness dashboard"
+    )
+    dashboard_parser.add_argument(
+        "--data-dir", default="outputs/shadow", help="directory containing audit logs"
+    )
+    dashboard_parser.add_argument("--port", type=int, default=8765)
+    dashboard_parser.add_argument("--no-browser", action="store_true")
+    synthetic_parser = subparsers.add_parser(
+        "test-intent-pipeline",
+        help="run an offline synthetic BUY through the real intent validator",
+    )
+    synthetic_parser.add_argument("--config", required=True)
+    synthetic_parser.add_argument("--output-dir", required=True)
     return parser
 
 
@@ -278,7 +345,229 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     options = parser.parse_args(arguments)
 
-    if options.command == "inspect-data":
+    if options.command == "test-intent-pipeline":
+        try:
+            profile = load_asset_profile(options.config)
+            output_dir = Path(options.output_dir)
+            now = datetime.now(UTC)
+            candle_start = (
+                now.replace(minute=0, second=0, microsecond=0)
+                - timedelta(hours=1)
+            )
+            candle = MarketSnapshot(
+                symbol=profile.symbol,
+                timestamp=candle_start,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal("1000"),
+            )
+            budget = min(profile.initial_investment, profile.maximum_position_size)
+            decision = Decision(
+                action=Action.BUY,
+                state=MarketState.NORMAL,
+                timestamp=candle.timestamp,
+                price=candle.close,
+                reason="Offline synthetic test of the intent-writing pipeline.",
+                facts={"synthetic_test": "true"},
+                cash_budget=budget,
+            )
+            shadow = EtoroDryRunResult(
+                strategy_version=profile.strategy_version,
+                requested_symbol=profile.symbol.removesuffix("-USD"),
+                profile_symbol=profile.symbol,
+                resolution=RESOLUTIONS["one-hour"],
+                completed_candle_count=1,
+                latest_candle=candle,
+                latest_decision=decision,
+                proposed_action="buy",
+                proposed_cash_budget=budget,
+                instrument_id=999999,
+                simulated_position_open=False,
+            )
+            summary = EtoroDemoPortfolioSummary(
+                currency="USD",
+                credit=Decimal("100000"),
+                available_cash=Decimal("100000"),
+                total_invested=Decimal("0"),
+                unrealized_profit_loss=Decimal("0"),
+                equity=Decimal("100000"),
+                open_position_count=0,
+                pending_order_count=0,
+            )
+            payload = {
+                "clientPortfolio": {
+                    "positions": [],
+                    "orders": [],
+                    "ordersForOpen": [],
+                    "mirrors": [],
+                }
+            }
+            readiness = EtoroIntentBuilder(
+                now=now, environment="synthetic_test"
+            ).build(
+                profile,
+                shadow,
+                summary,
+                payload,
+                ShadowControlState(),
+                IntentConstraints(
+                    minimum_order_usd=Decimal("10.00"),
+                    amount_increment_usd=Decimal("0.01"),
+                    maximum_candle_age=timedelta(minutes=90),
+                ),
+            )
+            intent_path = output_dir / "synthetic-intents.jsonl"
+            readiness_path = output_dir / "synthetic-readiness.jsonl"
+            written = IntentAuditWriter(intent_path).append(readiness)
+            ReadinessAuditWriter(readiness_path).append(
+                shadow, readiness, summary, observed_at=now
+            )
+        except (EtoroDemoError, ValueError) as error:
+            parser.error(str(error))
+        print("Offline synthetic intent-pipeline test")
+        print(f"ready={str(readiness.ready).lower()}")
+        print(f"decision={decision.action.value}")
+        print(f"intent_written={str(written).lower()}")
+        print("submitted=NO")
+        print("environment=synthetic_test")
+        print("execution_eligible=false")
+        print("network_access=NONE")
+        print("leverage=1x (no borrowing)")
+        print(f"Intent audit:       {intent_path.resolve()}")
+        print(f"Readiness audit:    {readiness_path.resolve()}")
+    elif options.command == "etoro-demo-reconcile-execution":
+        if options.poll_seconds < 2:
+            parser.error("--poll-seconds must be at least 2")
+        if options.timeout_seconds < options.poll_seconds:
+            parser.error("--timeout-seconds must be at least --poll-seconds")
+        try:
+            audited = IntentAuditReader(options.intent_log).load(options.intent_id)
+            ledger = ExecutionLedger(options.execution_ledger)
+            ledger.assert_submitted(audited.intent_id)
+            live_store = EtoroLiveStateStore(options.live_state)
+            state = live_store.load()
+            if state is None:
+                raise EtoroDemoError("live-state checkpoint does not exist")
+            is_close = audited.action == "close-entire-long-position"
+            if is_close:
+                closed_position_id = int(
+                    audited.request_path_template.rsplit("/", 1)[-1]
+                )
+                known_ids = state.broker_position_ids or (
+                    (() if state.broker_position_id is None else (state.broker_position_id,))
+                )
+                if closed_position_id not in known_ids:
+                    raise EtoroDemoError(
+                        "close intent does not belong to this live-state checkpoint"
+                    )
+            else:
+                expected_instrument = int(audited.request_body.get("instrumentId", 0))
+                if state.instrument_id != expected_instrument:
+                    raise EtoroDemoError("intent does not belong to this live-state checkpoint")
+            client = EtoroDemoReadOnlyClient(EtoroCredentials.from_environment())
+            deadline = time.monotonic() + options.timeout_seconds
+            position = None
+            while position is None:
+                payload = client.demo_pnl()
+                position = (
+                    reconcile_closed_long(
+                        audited,
+                        payload,
+                        expected_instrument_id=state.instrument_id,
+                        allowed_remaining_position_ids=tuple(
+                            item for item in state.broker_position_ids
+                            if item != closed_position_id
+                        ),
+                    )
+                    if is_close
+                    else reconcile_open_long(
+                        audited,
+                        payload,
+                        existing_position_ids=state.broker_position_ids,
+                    )
+                )
+                if position is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    raise EtoroDemoError(
+                        "reconciliation timed out with no confirmed position; "
+                        "do not resubmit the order"
+                    )
+                time.sleep(options.poll_seconds)
+            fields = position.audit_fields()
+            if is_close:
+                ledger.record_close_reconciliation(audited.intent_id, fields)
+                live_store.record_closed_position(
+                    intent_id=audited.intent_id,
+                    position_id=position.position_id,
+                    pnl_payload=payload,
+                )
+            else:
+                ledger.record_reconciliation(audited.intent_id, fields)
+                live_store.record_open_position(
+                    intent_id=audited.intent_id,
+                    position_id=position.position_id,
+                    amount_usd=str(position.amount_usd),
+                    units=str(position.units),
+                    open_rate=str(position.open_rate),
+                    fees_usd=(
+                        None if position.fees_usd is None else str(position.fees_usd)
+                    ),
+                )
+                if Path(options.portfolio_risk_state).exists():
+                    PortfolioRiskController(
+                        load_portfolio_risk_policy(options.portfolio_risk_config),
+                        options.portfolio_risk_state,
+                    ).release_reservation(
+                        audited.intent_id,
+                        changed_by="reconciliation-service",
+                        reason="Demo buy position reconciled",
+                    )
+        except (EtoroDemoError, ValueError, TypeError) as error:
+            parser.error(str(error))
+        print("eToro Demo execution reconciled")
+        print(f"Intent ID:        {audited.intent_id}")
+        print(f"Position ID:      {position.position_id}")
+        if is_close:
+            print("Result:           full position closed")
+        else:
+            print(f"Amount:           {position.amount_usd} USD")
+            print(f"Units:            {position.units}")
+            print(f"Fill/open rate:   {position.open_rate}")
+            print(
+                "Broker fees:      "
+                + (
+                    "not exposed by Demo P&L"
+                    if position.fees_usd is None
+                    else f"{position.fees_usd} USD"
+                )
+            )
+            print("Direction:        long")
+        print("Leverage:         1x (no borrowing)")
+        print("Order retry:      BLOCKED")
+        print(f"Live state:       {live_store.path.resolve()}")
+    elif options.command == "dashboard":
+        if not 1 <= options.port <= 65535:
+            parser.error("--port must be between 1 and 65535")
+        url = f"http://127.0.0.1:{options.port}/"
+        print("Codex Trading Simulator dashboard")
+        print(f"URL:              {url}")
+        print(f"Audit directory:  {Path(options.data_dir).resolve()}")
+        print("Network exposure: localhost only")
+        print("Order execution:  REAL BLOCKED; explicitly armed Demo only")
+        print("Leverage:         1x (no borrowing)")
+        print("Press Ctrl+C to stop.\n")
+        if not options.no_browser:
+            webbrowser.open(url)
+        try:
+            serve_dashboard(options.data_dir, options.port, Path.cwd())
+        except OSError as error:
+            parser.error(f"could not start dashboard: {error}")
+        except KeyboardInterrupt:
+            print("\nDashboard stopped.")
+    elif options.command == "inspect-data":
         try:
             data = CsvMarketDataLoader(options.csv_path, options.symbol).load()
         except MarketDataError as error:
@@ -562,6 +851,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
             parser.error("--poll-seconds must be at least 30")
         if options.max_cycles is not None and options.max_cycles < 1:
             parser.error("--max-cycles must be at least 1")
+        if options.max_consecutive_read_errors < 1:
+            parser.error("--max-consecutive-read-errors must be at least 1")
         try:
             profile = load_asset_profile(options.config)
             client = EtoroDemoReadOnlyClient(EtoroCredentials.from_environment())
@@ -710,21 +1001,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 event_log_path=options.shadow_log,
             )
             control = control_store.load()
-            shadow = EtoroDryRunner(client).run(
-                profile,
-                symbol=options.symbol,
-                resolution=options.resolution,
-                candle_count=options.candles,
-                manual_approval_times=control.approval_times,
-            )
             pnl_payload = client.demo_pnl()
             summary = client.demo_summary(pnl_payload)
+            shadow, live_store = _broker_aligned_shadow(
+                client, profile, options, control.approval_times, summary, pnl_payload
+            )
             constraints = IntentConstraints(
                 minimum_order_usd=options.minimum_order_usd,
                 amount_increment_usd=options.amount_increment_usd,
                 maximum_candle_age=timedelta(
                     minutes=options.max_candle_age_minutes
                 ),
+                portfolio_risk_controller=_portfolio_risk_controller(options),
             )
             readiness = EtoroIntentBuilder().build(
                 profile,
@@ -732,7 +1020,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 summary,
                 pnl_payload,
                 control,
-                constraints,
+                _live_intent_constraints(constraints, live_store),
             )
             written = IntentAuditWriter(options.intent_log).append(readiness)
         except (EtoroDemoError, ValueError) as error:
@@ -752,6 +1040,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         print("Leverage:         1x (no borrowing)")
         print("Order submitted:  NO")
         print("Adapter mode:     read-only")
+        print(f"Live state:       {live_store.path.resolve()}")
     elif options.command == "etoro-readiness-loop":
         if options.poll_seconds < 30:
             parser.error("--poll-seconds must be at least 30")
@@ -771,33 +1060,56 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 maximum_candle_age=timedelta(
                     minutes=options.max_candle_age_minutes
                 ),
+                portfolio_risk_controller=_portfolio_risk_controller(options),
             )
             readiness_writer = ReadinessAuditWriter(options.readiness_log)
             intent_writer = IntentAuditWriter(options.intent_log)
             shadow_writer = EtoroShadowRecorder(options.shadow_log)
+            live_store = EtoroLiveStateStore(
+                options.live_state or _default_live_state_path(options.shadow_log)
+            )
         except (EtoroDemoError, ValueError) as error:
             parser.error(str(error))
         print("eToro Demo continuous execution-readiness monitor")
         print(f"Readiness log:    {readiness_writer.path.resolve()}")
         print(f"Intent log:       {intent_writer.path.resolve()}")
+        print(f"Live state:       {live_store.path.resolve()}")
         print(f"Polling:          every {options.poll_seconds} seconds")
-        print("Failure policy:   halt on safety/reconciliation failure")
+        print(
+            "Failure policy:   halt on safety/reconciliation failure; "
+            f"retry {options.max_consecutive_read_errors} transient read errors"
+        )
         print("Order execution:  BLOCKED")
         print("Leverage:         1x (no borrowing)")
         print("Press Ctrl+C to stop.\n")
         cycles = 0
+        consecutive_read_errors = 0
         try:
             while True:
                 try:
                     control = control_store.load()
-                    shadow = EtoroDryRunner(client).run(
+                    pnl_payload = client.demo_pnl()
+                    summary = client.demo_summary(pnl_payload)
+                    shadow, live_store = _broker_aligned_shadow(
+                        client,
                         profile,
-                        symbol=options.symbol,
-                        resolution=options.resolution,
-                        candle_count=options.candles,
-                        manual_approval_times=control.approval_times,
+                        options,
+                        control.approval_times,
+                        summary,
+                        pnl_payload,
                     )
                     shadow_writer.record(shadow)
+                    latched_intent_id = _latest_unresolved_intent_id(
+                        intent_writer.path,
+                        (
+                            Path(options.execution_ledger)
+                            if options.execution_ledger
+                            else intent_writer.path.with_name(
+                                intent_writer.path.name.replace("-intents", "-execution")
+                            )
+                        ),
+                        live_store,
+                    )
                     already_evaluated = readiness_writer.has_candle(
                         shadow.strategy_version,
                         shadow.requested_symbol,
@@ -806,21 +1118,25 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     if control.kill_switch:
                         print("HALTED safely: local kill switch is enabled")
                         break
+                    if latched_intent_id is not None:
+                        print(
+                            f"{shadow.latest_candle.timestamp.isoformat()} | "
+                            f"monitoring | intent_pending_approval={latched_intent_id} | "
+                            "submitted=NO"
+                        )
                     if already_evaluated:
                         print(
                             f"{shadow.latest_candle.timestamp.isoformat()} | "
                             "already evaluated | submitted=NO"
                         )
-                    else:
-                        pnl_payload = client.demo_pnl()
-                        summary = client.demo_summary(pnl_payload)
+                    elif latched_intent_id is None:
                         readiness = EtoroIntentBuilder().build(
                             profile,
                             shadow,
                             summary,
                             pnl_payload,
                             control,
-                            constraints,
+                            _live_intent_constraints(constraints, live_store),
                         )
                         readiness_writer.append(shadow, readiness, summary)
                         intent_written = intent_writer.append(readiness)
@@ -835,7 +1151,28 @@ def main(arguments: Sequence[str] | None = None) -> int:
                         if readiness.halt_monitor:
                             print("HALTED safely; operator review is required.")
                             break
+                    consecutive_read_errors = 0
                 except EtoroDemoError as error:
+                    if (
+                        _is_transient_etoro_read_error(error)
+                        and consecutive_read_errors
+                        < options.max_consecutive_read_errors
+                    ):
+                        consecutive_read_errors += 1
+                        print(
+                            "Transient eToro read failure "
+                            f"({consecutive_read_errors}/"
+                            f"{options.max_consecutive_read_errors}): {error}"
+                        )
+                        print("    Retrying safely; no order was submitted.")
+                        cycles += 1
+                        if (
+                            options.max_cycles is not None
+                            and cycles >= options.max_cycles
+                        ):
+                            break
+                        time.sleep(options.poll_seconds)
+                        continue
                     print(f"HALTED safely: {error}")
                     break
                 cycles += 1
@@ -887,24 +1224,26 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 or _default_control_path(options.shadow_log),
                 event_log_path=options.shadow_log,
             ).load()
-            shadow = EtoroDryRunner(read_client).run(
-                profile,
-                symbol=options.symbol,
-                resolution=options.resolution,
-                candle_count=options.candles,
-                manual_approval_times=control.approval_times,
-            )
             pnl_payload = read_client.demo_pnl()
             summary = read_client.demo_summary(pnl_payload)
+            shadow, _live_store = _broker_aligned_shadow(
+                read_client, profile, options, control.approval_times, summary, pnl_payload
+            )
             constraints = IntentConstraints(
                 minimum_order_usd=options.minimum_order_usd,
                 amount_increment_usd=options.amount_increment_usd,
                 maximum_candle_age=timedelta(
                     minutes=options.max_candle_age_minutes
                 ),
+                portfolio_risk_controller=_portfolio_risk_controller(options),
             )
             current = EtoroIntentBuilder().build(
-                profile, shadow, summary, pnl_payload, control, constraints
+                profile,
+                shadow,
+                summary,
+                pnl_payload,
+                control,
+                _live_intent_constraints(constraints, _live_store),
             )
             if not current.ready or current.intent is None:
                 raise EtoroDemoError(
@@ -917,18 +1256,28 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 or dict(current.intent.request_body) != dict(audited.request_body)
             ):
                 raise EtoroDemoError("audited intent payload no longer matches")
-            amount = Decimal(str(audited.request_body.get("amount")))
-            if amount > options.max_demo_order_usd:
-                raise EtoroDemoError("intent exceeds --max-demo-order-usd")
+            is_close = audited.action == "close-entire-long-position"
+            if not is_close:
+                amount = Decimal(str(audited.request_body.get("amount")))
+                if amount > options.max_demo_order_usd:
+                    raise EtoroDemoError("intent exceeds --max-demo-order-usd")
             ledger.record_attempt(audited)
-            response = EtoroDemoExecutionClient(credentials).submit_open_long(audited)
+            execution_client = EtoroDemoExecutionClient(credentials)
+            response = (
+                execution_client.submit_close_long(audited)
+                if is_close
+                else execution_client.submit_open_long(audited)
+            )
             ledger.record_response(audited.intent_id, response)
         except (EtoroDemoError, ValueError, InvalidOperation) as error:
             parser.error(str(error))
         print("eToro Demo order response received")
         print(f"Intent ID:        {audited.intent_id}")
-        print(f"Amount:           {audited.request_body['amount']} USD")
-        print("Transaction:      BUY long")
+        if is_close:
+            print("Transaction:      CLOSE entire long position")
+        else:
+            print(f"Amount:           {audited.request_body['amount']} USD")
+            print("Transaction:      BUY long")
         print("Leverage:         1x (no borrowing)")
         print("Environment:      DEMO only")
         print(f"Execution ledger: {Path(options.execution_ledger).resolve()}")
@@ -976,6 +1325,138 @@ def _format_duration(value: timedelta) -> str:
     return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def _is_transient_etoro_read_error(error: Exception) -> bool:
+    """Identify read-only failures that are safe to retry."""
+
+    message = str(error).lower()
+    return (
+        "could not reach the etoro api" in message
+        or "etoro read failed (timeouterror)" in message
+        or "etoro read failed (connectionerror)" in message
+        or "etoro read failed (urlerror)" in message
+    )
+
+
 def _default_control_path(log_path: str) -> str:
     path = Path(log_path)
     return str(path.with_suffix(".control.json"))
+
+
+def _default_live_state_path(log_path: str) -> str:
+    path = Path(log_path)
+    return str(path.with_suffix(".live-state.json"))
+
+
+def _portfolio_risk_controller(options) -> PortfolioRiskController:
+    state_path = options.portfolio_risk_state or str(
+        Path(options.shadow_log).parent / "portfolio-risk-state.json"
+    )
+    return PortfolioRiskController(
+        load_portfolio_risk_policy(options.portfolio_risk_config), state_path
+    )
+
+
+def _live_intent_constraints(
+    constraints: IntentConstraints, live_store: EtoroLiveStateStore
+) -> IntentConstraints:
+    state = live_store.load()
+    if state is None:
+        return constraints
+    opened_at = None
+    if state.above_entry_stable_since is not None:
+        opened_at = datetime.fromisoformat(
+            state.above_entry_stable_since.replace("Z", "+00:00")
+        ).astimezone(UTC)
+    return replace(
+        constraints,
+        position_opened_at=opened_at,
+        existing_position_ids=state.broker_position_ids,
+        liquidation_pending=state.liquidation_pending,
+    )
+
+
+def _latest_unresolved_intent_id(
+    intent_path: Path,
+    execution_path: Path,
+    live_store: EtoroLiveStateStore,
+) -> str | None:
+    if not intent_path.exists():
+        return None
+    try:
+        lines = [line for line in intent_path.read_text(encoding="utf-8").splitlines() if line]
+        if not lines:
+            return None
+        value = json.loads(lines[-1])
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise EtoroDemoError("intent audit is invalid while checking approval latch") from error
+    if not isinstance(value, Mapping):
+        raise EtoroDemoError("intent audit contains a non-object record")
+    intent_id = value.get("intent_id")
+    if not isinstance(intent_id, str) or value.get("execution_eligible") is not True:
+        return None
+    state = live_store.load()
+    if state is not None and state.last_abandoned_intent_id == intent_id:
+        return None
+    abandonment_path = intent_path.with_name(
+        intent_path.name.replace("-intents", "-abandonments")
+    )
+    if abandonment_path.exists():
+        try:
+            abandonment_lines = [
+                line for line in abandonment_path.read_text(encoding="utf-8").splitlines()
+                if line
+            ]
+            if abandonment_lines:
+                abandonment = json.loads(abandonment_lines[-1])
+                if (
+                    isinstance(abandonment, Mapping)
+                    and abandonment.get("intent_id") == intent_id
+                ):
+                    return None
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise EtoroDemoError(
+                "intent abandonment audit is invalid while checking approval latch"
+            ) from error
+    try:
+        ExecutionLedger(execution_path).assert_not_attempted(intent_id)
+    except EtoroDemoError:
+        return None
+    return intent_id
+
+
+def _broker_aligned_shadow(
+    client: EtoroDemoReadOnlyClient,
+    profile,
+    options,
+    approval_times: tuple[datetime, ...],
+    summary,
+    pnl_payload,
+):
+    """Replay only candles after an immutable, flat Demo baseline."""
+    store = EtoroLiveStateStore(
+        options.live_state or _default_live_state_path(options.shadow_log)
+    )
+    state = store.load()
+    runner = EtoroDryRunner(client)
+    shadow = runner.run(
+        profile,
+        symbol=options.symbol,
+        resolution=options.resolution,
+        candle_count=options.candles,
+        manual_approval_times=approval_times,
+        trading_start_after=None if state is None else state.baseline,
+    )
+    if state is None:
+        state = store.initialise(shadow, summary, pnl_payload)
+        shadow = EtoroDryRunner(client).run(
+            profile,
+            symbol=options.symbol,
+            resolution=options.resolution,
+            candle_count=options.candles,
+            manual_approval_times=approval_times,
+            trading_start_after=state.baseline,
+        )
+    store.validate(state, shadow)
+    store.validate_recorded_position(state, pnl_payload)
+    store.record_scaling_observation(shadow)
+    return shadow, store

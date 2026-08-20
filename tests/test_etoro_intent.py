@@ -1,5 +1,6 @@
 import json
 import shutil
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -114,6 +115,118 @@ def test_buy_intent_is_cash_only_one_x_and_never_submitted() -> None:
         "leverage": 1,
     }
     assert result.intent.order_submitted is False
+
+
+def test_buy_intent_ignores_other_long_one_x_assets() -> None:
+    pnl = _empty_pnl()
+    pnl["clientPortfolio"]["positions"] = [{
+        "positionID": 99,
+        "instrumentID": 999,
+        "isBuy": True,
+        "leverage": 1,
+        "amount": "500",
+    }]
+    result = EtoroIntentBuilder(
+        now=datetime(2026, 8, 20, 11, 30, tzinfo=UTC)
+    ).build(
+        load_asset_profile(PROJECT / "configs" / "btc_example.toml"),
+        _shadow(), _summary(), pnl, ShadowControlState(), _constraints(),
+    )
+    assert result.ready
+
+
+def test_buy_signal_while_matching_position_open_is_suppressed_without_halt() -> None:
+    pnl = _empty_pnl()
+    pnl["clientPortfolio"]["positions"] = [{
+        "positionID": 123,
+        "instrumentID": 100,
+        "isBuy": True,
+        "leverage": 1,
+        "amount": "1000",
+    }]
+    summary = EtoroDemoPortfolioSummary(
+        "USD", Decimal("99000"), Decimal("99000"), Decimal("1000"),
+        Decimal("0"), Decimal("100000"), 1, 0,
+    )
+
+    result = EtoroIntentBuilder(
+        now=datetime(2026, 8, 20, 11, 30, tzinfo=UTC)
+    ).build(
+        load_asset_profile(PROJECT / "configs" / "btc_example.toml"),
+        _shadow(Action.BUY), summary, pnl, ShadowControlState(), _constraints(),
+    )
+
+    assert not result.ready
+    assert not result.halt_monitor
+    assert result.intent is None
+    assert "requires stabilising or recovering" in result.reason
+
+
+def test_stabilised_pullback_creates_bounded_additional_buy_intent() -> None:
+    pnl = _empty_pnl()
+    pnl["clientPortfolio"]["positions"] = [{
+        "positionID": 123,
+        "instrumentID": 100,
+        "isBuy": True,
+        "leverage": 1,
+        "amount": "1000",
+        "openRate": "72000",
+    }]
+    shadow = _shadow(Action.BUY)
+    shadow = replace(
+        shadow,
+        latest_decision=replace(shadow.latest_decision, state=MarketState.STABILISING),
+    )
+    summary = EtoroDemoPortfolioSummary(
+        "USD", Decimal("99000"), Decimal("99000"), Decimal("1000"),
+        Decimal("0"), Decimal("100000"), 1, 0,
+    )
+    constraints = replace(
+        _constraints(),
+        position_opened_at=datetime(2026, 8, 18, tzinfo=UTC),
+        existing_position_ids=(123,),
+    )
+
+    result = EtoroIntentBuilder(
+        now=datetime(2026, 8, 20, 11, 30, tzinfo=UTC)
+    ).build(
+        load_asset_profile(PROJECT / "configs" / "btc_example.toml"),
+        shadow, summary, pnl, ShadowControlState(), constraints,
+    )
+
+    assert result.ready
+    assert result.intent is not None
+    assert result.intent.action == "add-long-by-cash-amount"
+    assert result.intent.request_body["amount"] == "625.0000"
+    assert result.intent.request_body["leverage"] == 1
+    assert "controlled additional buy" in result.reason
+
+
+def test_sell_intent_targets_matching_position_with_other_assets_open() -> None:
+    pnl = _empty_pnl()
+    pnl["clientPortfolio"]["positions"] = [
+        {"positionID": 99, "instrumentID": 999, "isBuy": True, "leverage": 1},
+        {"positionID": 123, "instrumentID": 100, "isBuy": True, "leverage": 1},
+    ]
+    summary = _summary()
+    summary = EtoroDemoPortfolioSummary(
+        summary.currency, summary.credit, summary.available_cash,
+        summary.total_invested, summary.unrealized_profit_loss, summary.equity,
+        2, 0,
+    )
+    result = EtoroIntentBuilder(
+        now=datetime(2026, 8, 20, 11, 30, tzinfo=UTC)
+    ).build(
+        load_asset_profile(PROJECT / "configs" / "btc_example.toml"),
+        _shadow(Action.SELL), summary, pnl, ShadowControlState(), _constraints(),
+    )
+    assert result.ready
+    assert result.intent is not None
+    assert result.intent.request_path_template.endswith("/positions/123")
+    assert result.intent.request_body == {
+        "InstrumentId": 100,
+        "UnitsToDeduct": None,
+    }
 
 
 @pytest.mark.parametrize(

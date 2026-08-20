@@ -1,0 +1,8 @@
+[portfolio_risk]
+maximum_asset_exposure_usd = "2500.00"
+maximum_total_exposure_usd = "4000.00"
+minimum_cash_reserve_usd = "1000.00"
+maximum_open_assets = 4
+maximum_daily_loss_rate = "0.05"
+maximum_drawdown_rate = "0.10"
+reservation_ttl_minutes = 180

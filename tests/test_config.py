@@ -18,6 +18,27 @@ def test_example_profile_loads_exact_decimal_values() -> None:
     assert profile.estimated_fee_rate == Decimal("0.0025")
 
 
+@pytest.mark.parametrize(
+    ("filename", "symbol", "version"),
+    [
+        ("eth_example.toml", "ETH-USD", "ETH-v1.0"),
+        ("sol_example.toml", "SOL-USD", "SOL-v1.0"),
+        ("xrp_example.toml", "XRP-USD", "XRP-v1.1-15m"),
+    ],
+)
+def test_additional_watchlist_profiles_are_independent(
+    filename: str, symbol: str, version: str
+) -> None:
+    profile = load_asset_profile(PROJECT_ROOT / "configs" / filename)
+
+    assert profile.symbol == symbol
+    assert profile.strategy_version == version
+    assert profile.initial_investment == Decimal("1000.00")
+    assert profile.maximum_position_size == Decimal("2500.00")
+    if symbol == "XRP-USD":
+        assert profile.persistent_decline_candles == 24
+
+
 def test_position_limit_cannot_be_below_initial_investment() -> None:
     values = dict(
         symbol="TEST",
@@ -38,6 +59,10 @@ def test_position_limit_cannot_be_below_initial_investment() -> None:
         staged_reentry_profit_rate=Decimal("0.25"),
         observation_period_hours=48,
         maximum_position_size=Decimal("900"),
+        scale_in_allocation_rate=Decimal("0.25"),
+        scale_in_pullback_rate=Decimal("0.02"),
+        scale_in_above_entry_hours=48,
+        maximum_scale_in_tranches=3,
         structural_breakdown_rate=Decimal("0.35"),
         structural_peak_drawdown_rate=Decimal("0.40"),
         structural_range_lookback_hours=168,

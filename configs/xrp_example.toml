@@ -1,11 +1,10 @@
 # Educational example assumptions only; these are not recommended parameters.
-symbol = "BTC-USD"
-strategy_version = "BTC-v1.0"
+symbol = "XRP-USD"
+strategy_version = "XRP-v1.1-15m"
 initial_investment = "1000.00"
 minimum_net_profit_rate = "0.05"
 rapid_appreciation_rate = "0.12"
 rapid_appreciation_window_hours = 24
-# State-classification examples only; not claimed to be suitable for BTC.
 market_state_lookback_hours = 3
 uptrend_rate = "0.03"
 declining_rate = "0.02"
@@ -23,13 +22,12 @@ scale_in_pullback_rate = "0.02"
 scale_in_above_entry_hours = 48
 maximum_scale_in_tranches = 3
 structural_breakdown_rate = "0.35"
-# Manual-review safeguards; illustrative assumptions, not recommendations.
 structural_peak_drawdown_rate = "0.40"
 structural_range_lookback_hours = 168
 structural_range_break_rate = "0.20"
 volatility_lookback_hours = 24
 extreme_volatility_rate = "0.15"
-persistent_decline_candles = 6
+persistent_decline_candles = 24
 estimated_fee_rate = "0.0025"
 estimated_spread_rate = "0.0010"
 estimated_slippage_rate = "0.0010"

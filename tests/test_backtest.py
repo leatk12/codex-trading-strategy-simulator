@@ -40,6 +40,26 @@ def test_basic_backtest_records_every_decision_and_trade() -> None:
     assert len(result.decisions) == len(data)
 
 
+def test_live_warmup_candles_cannot_create_a_hypothetical_position() -> None:
+    profile = load_asset_profile(PROJECT_ROOT / "configs" / "btc_example.toml")
+    data = CsvMarketDataLoader(
+        PROJECT_ROOT / "data" / "basic_strategy_example.csv", profile.symbol
+    ).load()
+
+    baseline = Backtest(
+        profile, data, trading_start_after=data[-1].timestamp
+    ).run()
+    next_signal = Backtest(
+        profile, data, trading_start_after=data[-2].timestamp
+    ).run()
+
+    assert baseline.trades == ()
+    assert baseline.decisions[-1].action is Action.HOLD
+    assert baseline.decisions[-1].facts["live_warmup"] == "true"
+    assert next_signal.trades[0].side is TradeSide.BUY
+    assert next_signal.trades[0].timestamp == data[-1].timestamp
+
+
 def test_backtest_reinvests_only_configured_profit_slice_on_reentry() -> None:
     profile = load_asset_profile(PROJECT_ROOT / "configs" / "btc_example.toml")
     data = CsvMarketDataLoader(

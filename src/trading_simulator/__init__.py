@@ -41,6 +41,7 @@ from .etoro_shadow import (
     ShadowRiskEvent,
 )
 from .etoro_shadow_loop import EtoroShadowRecorder, ShadowRecordOutcome
+from .etoro_live_state import EtoroLiveState, EtoroLiveStateStore
 from .shadow_control import (
     ShadowApproval,
     ShadowControlState,
@@ -103,6 +104,8 @@ __all__ = [
     "EtoroDemoExecutionClient",
     "EtoroDryRunner",
     "EtoroIntentBuilder",
+    "EtoroLiveState",
+    "EtoroLiveStateStore",
     "EtoroOrderIntent",
     "EtoroDryRunResult",
     "EtoroResolution",
