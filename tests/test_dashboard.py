@@ -10,6 +10,7 @@ import pytest
 
 from trading_simulator.dashboard import (
     AUTOMATION_ARMING_PHRASE,
+    DashboardAuthenticator,
     DashboardActions,
     DashboardData,
     DashboardMonitorManager,
@@ -17,6 +18,8 @@ from trading_simulator.dashboard import (
     MONITOR_SPECS,
     _execution_summary,
     _last_monitor_halt,
+    hash_dashboard_password,
+    verify_dashboard_password,
 )
 from trading_simulator.etoro_demo import EtoroDemoError
 from trading_simulator.etoro_demo import EtoroDemoPortfolioSummary
@@ -25,6 +28,39 @@ from trading_simulator.shadow_control import ShadowControlState, ShadowControlSt
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PROJECT = Path(__file__).resolve().parents[1]
+
+
+def test_dashboard_password_hash_is_salted_and_verifiable() -> None:
+    first = hash_dashboard_password("a-long-test-password")
+    second = hash_dashboard_password("a-long-test-password")
+
+    assert first != second
+    assert verify_dashboard_password("a-long-test-password", first)
+    assert not verify_dashboard_password("wrong-password", first)
+    assert not verify_dashboard_password("a-long-test-password", "malformed")
+
+
+def test_dashboard_authenticator_issues_and_revokes_session() -> None:
+    auth = DashboardAuthenticator(
+        "operator", hash_dashboard_password("a-long-test-password")
+    )
+
+    assert auth.login("operator", "wrong-password", "127.0.0.1") is None
+    token = auth.login("operator", "a-long-test-password", "127.0.0.1")
+    assert token is not None
+    assert auth.authenticated(token)
+    auth.logout(token)
+    assert not auth.authenticated(token)
+
+
+def test_dashboard_authenticator_rate_limits_repeated_failures() -> None:
+    auth = DashboardAuthenticator(
+        "operator", hash_dashboard_password("a-long-test-password")
+    )
+    for _ in range(5):
+        assert auth.login("operator", "wrong-password", "127.0.0.1") is None
+
+    assert auth.login("operator", "a-long-test-password", "127.0.0.1") is None
 
 
 @pytest.fixture
@@ -474,3 +510,4 @@ def test_dashboard_reconciliation_reuses_read_only_cli_without_order() -> None:
     command = run.call_args.args[0]
     assert "etoro-demo-reconcile-execution" in command
     assert "etoro-demo-execute-intent" not in command
+
