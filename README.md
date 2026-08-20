@@ -1,0 +1,2 @@
+# AutomatedTradingBot
+Made with codex
