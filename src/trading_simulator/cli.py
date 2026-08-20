@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import time
 import webbrowser
@@ -17,7 +18,7 @@ from .audit import AuditExporter, AuditExportError
 from .backtest import Backtest
 from .config import load_asset_profile
 from .domain import Action, Decision, MarketSnapshot, MarketState
-from .dashboard import serve_dashboard
+from .dashboard import DashboardAuthenticator, hash_dashboard_password, serve_dashboard
 from .experiments import (
     ExperimentCase,
     ExperimentError,
@@ -332,6 +333,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     dashboard_parser.add_argument("--port", type=int, default=8765)
     dashboard_parser.add_argument("--no-browser", action="store_true")
+    subparsers.add_parser(
+        "dashboard-password-hash",
+        help="securely prompt for a dashboard password and print its salted hash",
+    )
     synthetic_parser = subparsers.add_parser(
         "test-intent-pipeline",
         help="run an offline synthetic BUY through the real intent validator",
@@ -548,9 +553,22 @@ def main(arguments: Sequence[str] | None = None) -> int:
         print("Leverage:         1x (no borrowing)")
         print("Order retry:      BLOCKED")
         print(f"Live state:       {live_store.path.resolve()}")
+    elif options.command == "dashboard-password-hash":
+        password = getpass.getpass("New dashboard password (12+ characters): ")
+        confirmation = getpass.getpass("Confirm dashboard password: ")
+        if password != confirmation:
+            parser.error("dashboard passwords do not match")
+        try:
+            print(hash_dashboard_password(password))
+        except ValueError as error:
+            parser.error(str(error))
     elif options.command == "dashboard":
         if not 1 <= options.port <= 65535:
             parser.error("--port must be between 1 and 65535")
+        try:
+            dashboard_auth = DashboardAuthenticator.from_environment()
+        except ValueError as error:
+            parser.error(f"could not start dashboard: {error}")
         url = f"http://127.0.0.1:{options.port}/"
         print("Codex Trading Simulator dashboard")
         print(f"URL:              {url}")
@@ -562,8 +580,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if not options.no_browser:
             webbrowser.open(url)
         try:
-            serve_dashboard(options.data_dir, options.port, Path.cwd())
-        except OSError as error:
+            serve_dashboard(
+                options.data_dir, options.port, Path.cwd(), dashboard_auth
+            )
+        except (OSError, ValueError) as error:
             parser.error(f"could not start dashboard: {error}")
         except KeyboardInterrupt:
             print("\nDashboard stopped.")
@@ -1460,3 +1480,4 @@ def _broker_aligned_shadow(
     store.validate_recorded_position(state, pnl_payload)
     store.record_scaling_observation(shadow)
     return shadow, store
+
