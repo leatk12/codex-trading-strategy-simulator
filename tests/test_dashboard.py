@@ -15,9 +15,11 @@ from trading_simulator.dashboard import (
     DashboardData,
     DashboardMonitorManager,
     DemoAutomationCoordinator,
+    HTML,
     MONITOR_SPECS,
     _execution_summary,
     _last_monitor_halt,
+    _write_http_body,
     hash_dashboard_password,
     verify_dashboard_password,
 )
@@ -94,6 +96,40 @@ def test_xrp_dashboard_monitor_uses_isolated_fifteen_minute_stream() -> None:
     assert spec.stem == "xrp-fifteen-minutes"
     assert spec.candle_count == 800
     assert spec.poll_seconds == 60
+
+
+def test_lac_dashboard_monitor_is_isolated_equity_and_manual_only() -> None:
+    spec = MONITOR_SPECS["lac"]
+
+    assert spec.resolution == "one-hour"
+    assert spec.stem == "lac-one-hour"
+    assert spec.asset_class == "equity"
+    assert spec.automation_allowed is False
+    lac = DashboardData(FIXTURES / "dashboard_valid").snapshot().assets[-1]
+    assert lac["asset"] == "LAC"
+    assert lac["asset_class"] == "equity"
+    assert lac["automation_allowed"] is False
+
+
+def test_dashboard_has_ajax_style_asset_class_tabs() -> None:
+    assert "selectAssetClass('crypto')" in HTML
+    assert "selectAssetClass('equity')" in HTML
+    assert "latestStatus.assets.filter" in HTML
+    assert "location.href" not in HTML.split("function selectAssetClass", 1)[1].split(
+        "function renderAssets", 1
+    )[0]
+
+
+@pytest.mark.parametrize(
+    "error", [BrokenPipeError(), ConnectionAbortedError(), ConnectionResetError()]
+)
+def test_dashboard_tolerates_cancelled_browser_response(error: OSError) -> None:
+    stream = Mock()
+    stream.write.side_effect = error
+
+    _write_http_body(stream, b"response")
+
+    stream.write.assert_called_once_with(b"response")
 
 
 def test_dashboard_tolerates_missing_and_malformed_logs() -> None:
@@ -272,6 +308,26 @@ def test_demo_automation_defers_unusual_climb_exit_to_operator(automation_dir) -
     audit = (automation_dir / "demo-automation-audit.jsonl").read_text(encoding="utf-8")
     assert "operator_approval_required" in audit
     assert "unusual-exit" in audit
+
+
+def test_demo_automation_never_submits_manual_only_equity(automation_dir) -> None:  # type: ignore[no-untyped-def]
+    actions = Mock()
+    monitors = Mock()
+    coordinator = DemoAutomationCoordinator(Mock(), actions, monitors, automation_dir)
+
+    coordinator._process_asset({
+        "asset": "LAC",
+        "can_execute_demo": True,
+        "intent_id": "lac-equity-intent",
+        "automation_review_required": False,
+        "reconciliation_pending": False,
+    })
+
+    actions.execute_demo_intent.assert_not_called()
+    monitors.pause_for_execution.assert_not_called()
+    audit = (automation_dir / "demo-automation-audit.jsonl").read_text(encoding="utf-8")
+    assert "operator_approval_required" in audit
+    assert "unattended automation is disabled for this asset class" in audit
 
 
 @pytest.mark.parametrize("safety_flag", ["risk_active", "kill_switch"])

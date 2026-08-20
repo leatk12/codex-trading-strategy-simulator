@@ -1,5 +1,47 @@
 # Trading Strategy Simulator — Milestones 1–11
 
+## Lithium Americas Corp equity watchlist (Version 0.35.0)
+
+Version 0.35 adds Lithium Americas Corp as the first non-crypto watchlist asset.
+eToro currently identifies the NYSE-listed equity by ticker `LAC`; the
+authenticated instrument search remains authoritative for the user's Demo
+account and region. Its independent profile is `configs/lac_example.toml`, and
+the dashboard-owned monitor uses completed one-hour candles with isolated
+`lac-one-hour*` state and audit files.
+
+LAC is deliberately **not eligible for unattended Demo automation**. The
+exchange closes overnight, at weekends and on market holidays, and the initial
+equity thresholds have not been validated against an out-of-sample equity
+history. Monitoring and intent generation are available, but any LAC Demo order
+requires the existing operator approval and arming flow. Real orders, leverage,
+borrowing, shorts and automatic retries remain blocked. The shared portfolio
+limit remains four open assets, so adding a fifth watchlist asset does not
+silently increase portfolio exposure.
+
+First perform a one-shot, non-executing instrument and candle check:
+
+```powershell
+python -m trading_simulator etoro-dry-run `
+  --config configs\lac_example.toml `
+  --symbol LAC `
+  --resolution one-hour `
+  --candles 500
+```
+
+After a successful check, restart the authenticated dashboard. Its LAC card can
+start the isolated readiness monitor. Outside NYSE trading hours it is normal
+for repeated polls to find no newly completed candle; deduplication prevents a
+second evaluation or intent for the same candle.
+
+The dashboard uses **Crypto** and **Stocks** tabs. Switching tabs filters the
+most recently fetched status document in the browser and does not navigate,
+reload the page, stop a monitor, or make an additional broker request. The
+shared portfolio-risk panel remains visible because its limits apply across
+both asset classes.
+
+Public instrument reference:
+<https://www.etoro.com/markets/lac>
+
 ## Supervised Demo automation (Version 0.33.0)
 
 The localhost dashboard can now opt into persistent, rule-based automation for
@@ -558,6 +600,109 @@ change and depend on personal circumstances, so implementation must be checked
 against then-current HMRC guidance and reviewed by a qualified UK tax adviser
 where appropriate. Tax rates and allowances will not be embedded as timeless
 strategy configuration.
+
+## Planned Milestone 13 — Versioned dashboard rule specification
+
+This milestone will add an authenticated dashboard area for inspecting,
+drafting, validating and explicitly activating strategy and safety rules. It is
+prioritised before performance intelligence so every later report can identify
+the exact universal rule, asset override and exception version that governed a
+decision.
+
+Rules will use a typed, declarative schema rather than free-form Python,
+JavaScript, expressions or uploaded executable code. The dashboard will expose
+only parameters and conditions implemented and validated by the simulator. It
+will support:
+
+- universal defaults shared by every eligible asset;
+- asset-class policies, such as separate crypto and exchange-traded-equity
+  defaults;
+- per-asset overrides for entries, exits, trailing exits, scale-ins,
+  observation periods, allocation limits and risk thresholds;
+- explicit asset exclusion from monitoring, intent generation, unattended Demo
+  automation or all new buying, without silently closing an existing position;
+- allowlisted context exceptions based on observable state such as market
+  regime, candle resolution, exchange session, volatility range, drawdown,
+  position state, allocation, data quality or an active risk event;
+- user-defined exception records assembled from those allowlisted conditions and
+  actions, with a required name, rationale, scope, priority, effective period
+  and expiry/review date;
+- a resolved-rule preview explaining inheritance in order: immutable safety
+  floor, universal default, asset-class policy, asset override, then matching
+  context exception;
+- conflict detection, unreachable-rule warnings and a deterministic explanation
+  of which rule wins when multiple exceptions match;
+- side-by-side diffs, validation errors, affected-asset previews and an audit
+  history showing author, reviewer, timestamps and reasons;
+- export/import of non-secret rule bundles with schema and strategy versions,
+  checksums and rejection of unknown or unsupported fields.
+
+Edits will create drafts only. Activation will require authentication, a written
+reason, an exact confirmation phrase, successful schema validation and a new
+immutable strategy/rule-set version. Material changes must also pass the
+existing development/holdout experiment workflow before they can become
+eligible for supervised Demo use. Active monitors will not hot-swap rules
+mid-candle: they will adopt an approved version only at a defined safe boundary
+and record that transition before evaluating another candle.
+
+Several invariants will remain outside the editable hierarchy: real-account
+execution stays blocked, leverage and borrowing remain prohibited, shorts and
+automatic order retries remain unavailable, reconciliation and portfolio risk
+cannot be bypassed, and reporting cannot activate a rule. An exception may only
+make behavior more restrictive unless its action and parameter have been
+explicitly classified as safely overrideable. Unknown context, stale data,
+conflicts, expired exceptions or invalid inheritance will fail closed and
+prevent a new order.
+
+## Planned Milestone 14 — Portfolio and asset performance intelligence
+
+This late-stage milestone will add a separate authenticated reporting area for
+the complete portfolio and for each individual asset. It will consume immutable
+decision, intent, execution, reconciliation, position-lot, equity and cost
+records; reporting must never be allowed to mutate execution state or strategy
+configuration.
+
+At minimum, the reporting dashboard will provide:
+
+- a transaction ledger containing every buy, additional buy and sell, with
+  timestamps, asset class, strategy/rule version, broker position/intent
+  reference, quantity, execution price, cash amount, fees, spread/slippage
+  evidence, holding period and realised result;
+- realised, unrealised and combined P/L by transaction, asset, strategy version,
+  asset class, selected date range and entire portfolio;
+- total, average, median, best and worst P/L; win/loss/breakeven counts and
+  rates; average win and loss; payoff ratio; profit factor; expectancy; return
+  on allocated capital; exposure, turnover and total cost drag;
+- equity and drawdown curves, peak-to-trough drawdown, recovery duration,
+  volatility, downside deviation, and risk-adjusted measures where the data and
+  sampling assumptions make them defensible;
+- open-position and lot-level views showing weighted cost, current allocation,
+  unrealised P/L, age, remaining asset/portfolio capacity and concentration;
+- rule-effectiveness analysis showing how often every entry, scale-in, exit,
+  trailing-exit, structural-risk and manual-review rule was evaluated, triggered,
+  blocked, approved, refused, executed and followed by a profitable or losing
+  outcome;
+- rule results segmented by market state, asset class, candle resolution,
+  strategy version and time period, including sample size and missing-data
+  warnings so a small number of successes is not presented as reliable evidence;
+- operational metrics covering intent-to-execution time, rejection and
+  reconciliation rates, manual-intervention frequency, stale-data/API failures,
+  monitor uptime and kill-switch activations;
+- filterable charts and tables plus CSV/JSON export whose figures reconcile back
+  to the underlying immutable audit references.
+
+Backtest, synthetic, eToro Demo and any future real-account evidence will remain
+visibly separated. Currency conversion and UK tax reporting will link to the
+Milestone 12 evidence model rather than silently mixing USD performance with GBP
+tax calculations. Deposits and withdrawals must be distinguished from trading
+returns before portfolio-level return measures are calculated.
+
+Rule analysis is descriptive evidence, not permission for self-optimisation.
+The system may identify weak rules, trade-offs and candidates for a separately
+versioned experiment, but it must not automatically change thresholds, promote a
+strategy, execute a newly inferred rule, or claim causal effectiveness. Any rule
+change will continue through explicit development/holdout testing, documented
+operator review and a new immutable strategy version.
 
 ## Read-only eToro Demo adapter and shadow mode (Version 0.12.0)
 
